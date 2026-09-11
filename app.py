@@ -20,8 +20,8 @@ DEFAULT_QUERY = (
     "Promoter holding > 50"
 )
 
-st.title("📈 Smart Stock Scanner V6")
-st.caption("1000+ stock technical scan • exact 7 fundamental filters • BTST / 2–4 day swing research")
+st.title("📈 Smart Stock Scanner V6.2")
+st.caption("1000+ stock technical scan • exact 7 fundamental filters • robust Swing Score • BTST / 2–4 day swing research")
 
 st.info(
     "V6 changes the scan order: it first builds a broad 1000+ stock universe and scans technical price history "
@@ -391,15 +391,28 @@ def technical_scan(symbols, batch_size=100, workers=4):
 
 
 def score_rows(out):
+    """Calculate a robust 0-100 technical swing score.
+
+    Missing optional indicators (especially volume/RSI on some BSE names) do NOT
+    turn the whole score into NaN. Available components are re-weighted to 100%.
+    This keeps fundamentally-qualified stocks rankable while never inventing data.
+    """
     def clip_score(x, lo, hi):
         if pd.isna(x):
             return np.nan
         return max(0.0, min(100.0, (x - lo) / (hi - lo) * 100.0))
-    trend = out["EMA Distance %"].apply(lambda x: clip_score(x, 0, 20))
-    rsi = out["RSI 14"].apply(lambda x: 100 - abs(x - 55) * 2 if pd.notna(x) else np.nan).clip(lower=0, upper=100)
-    vol = out["Volume/20D"].apply(lambda x: clip_score(x, 0.7, 2.0))
-    mom = out["5D %"].apply(lambda x: clip_score(x, -2, 8))
-    return (0.35 * trend + 0.25 * rsi + 0.20 * vol + 0.20 * mom).round(1)
+
+    components = pd.DataFrame({
+        "trend": out["EMA Distance %"].apply(lambda x: clip_score(x, 0, 20)),
+        "rsi": out["RSI 14"].apply(lambda x: 100 - abs(x - 55) * 2 if pd.notna(x) else np.nan).clip(lower=0, upper=100),
+        "volume": out["Volume/20D"].apply(lambda x: clip_score(x, 0.7, 2.0)),
+        "momentum": out["5D %"].apply(lambda x: clip_score(x, -2, 8)),
+    }, index=out.index)
+    weights = pd.Series({"trend": 0.35, "rsi": 0.25, "volume": 0.20, "momentum": 0.20})
+    weighted = components.mul(weights, axis=1)
+    available_weight = components.notna().mul(weights, axis=1).sum(axis=1)
+    score = weighted.sum(axis=1, min_count=1).div(available_weight.replace(0, np.nan)).mul(100 / 100)
+    return score.round(1)
 
 
 # --------------------------- LOAD SOURCES ---------------------------
@@ -429,7 +442,7 @@ combined["Fundamental Pass"] = combined["NSE Symbol"].isin(fund_syms)
 st.write(f"**Technical universe sent to Yahoo: {len(combined)} stocks** (minimum broad universe {int(universe_size)} + any fundamental-qualified additions).")
 st.caption("This is the key V6 change: technical analysis is no longer limited to the 50 Screener-qualified names.")
 
-if st.button("🚀 RUN V6 — SCAN 1000+ STOCKS", type="primary", use_container_width=True):
+if st.button("🚀 RUN V6.2 — SCAN 1000+ STOCKS", type="primary", use_container_width=True):
     with st.spinner(f"Scanning {len(combined)} stocks for price, 200 EMA, RSI, volume and momentum..."):
         tech = technical_scan(combined["NSE Symbol"].tolist(), int(batch_size), int(max_workers))
 
@@ -445,6 +458,7 @@ if st.button("🚀 RUN V6 — SCAN 1000+ STOCKS", type="primary", use_container_
         out["Technical Pass"] &= out["Volume/20D"].ge(min_volume_ratio).fillna(False)
 
     out["Swing Score"] = score_rows(out)
+    out["Score Coverage"] = out[["EMA Distance %", "RSI 14", "Volume/20D", "5D %"]].notna().sum(axis=1)
     out["Final Pass"] = out["Fundamental Pass"] & out["Technical Pass"]
 
     # Final ranking is only for stocks satisfying the exact fundamental filters.
@@ -465,7 +479,7 @@ if st.button("🚀 RUN V6 — SCAN 1000+ STOCKS", type="primary", use_container_
     c3.metric("Fundamental pass", fund_count)
     c4.metric("Final pass", final_count)
 
-    st.subheader("V6 Final Ranked Results")
+    st.subheader("V6.2 Final Ranked Results")
     st.success(f"{final_count} stocks passed all 7 fundamental filters + selected technical filters.")
     if missing:
         st.warning(f"{missing} stocks had insufficient/missing Yahoo price history. They are NOT treated as passes.")
@@ -473,15 +487,15 @@ if st.button("🚀 RUN V6 — SCAN 1000+ STOCKS", type="primary", use_container_
     display_cols = [c for c in [
         "Company", "NSE Symbol", "Exchange", "Yahoo Ticker", "Fundamental Pass",
         "Price", "Historical Close", "200 EMA", "EMA Distance %", "Above 200 EMA", "RSI 14",
-        "Volume/20D", "5D %", "20D %", "Swing Score", "Technical Status",
+        "Volume/20D", "5D %", "20D %", "Swing Score", "Score Coverage", "Technical Status",
         "Technical Pass", "Final Pass"
     ] if c in out.columns]
 
     st.dataframe(out[display_cols], use_container_width=True, hide_index=True)
     st.download_button(
-        "⬇️ Download V6 full scan CSV",
+        "⬇️ Download V6.2 full scan CSV",
         out.to_csv(index=False).encode(),
-        "smart_stock_scanner_v6_full_scan.csv",
+        "smart_stock_scanner_v6_2_full_scan.csv",
         "text/csv",
         use_container_width=True,
     )
