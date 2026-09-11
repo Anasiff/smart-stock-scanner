@@ -58,7 +58,7 @@ with st.sidebar:
 
     st.divider()
     st.header("Diagnostics")
-    st.caption("V6 deliberately reports missing technical data instead of treating it as a pass.")
+    st.caption("Price uses the latest same-day 15-minute Yahoo bar when available; 200 EMA remains based on daily history. Yahoo may still be delayed.")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -195,17 +195,18 @@ def normalize_yahoo_frame(hist, ticker):
     return close, volume
 
 
-def calc_technical(sym, ticker, hist):
+def calc_technical(sym, ticker, hist, current_price=np.nan):
     norm = normalize_yahoo_frame(hist, ticker)
     if norm is None:
         return None
     close, volume = norm
-    last_price = float(close.iloc[-1])
+    historical_close = float(close.iloc[-1])
+    last_price = float(current_price) if pd.notna(current_price) and float(current_price) > 0 else historical_close
     if len(close) < 210:
         return {
             "NSE Symbol": sym, "Yahoo Ticker": ticker,
             "Exchange": "BSE" if ticker.endswith(".BO") else "NSE",
-            "Price": last_price, "200 EMA": np.nan, "EMA Distance %": np.nan,
+            "Price": last_price, "Historical Close": historical_close, "200 EMA": np.nan, "EMA Distance %": np.nan,
             "Above 200 EMA": False, "RSI 14": np.nan, "Volume/20D": np.nan,
             "5D %": np.nan, "20D %": np.nan, "Technical Status": "Insufficient history",
         }
@@ -226,7 +227,7 @@ def calc_technical(sym, ticker, hist):
     return {
         "NSE Symbol": sym, "Yahoo Ticker": ticker,
         "Exchange": "BSE" if ticker.endswith(".BO") else "NSE",
-        "Price": last_price, "200 EMA": last_ema, "EMA Distance %": dist,
+        "Price": last_price, "Historical Close": historical_close, "200 EMA": last_ema, "EMA Distance %": dist,
         "Above 200 EMA": bool(last_price > last_ema), "RSI 14": last_rsi,
         "Volume/20D": vr, "5D %": ret5, "20D %": ret20, "Technical Status": "OK",
     }
@@ -276,6 +277,54 @@ def batch_download(tickers, batch_size, workers):
     return output
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def latest_intraday_prices(tickers, batch_size=50, workers=4):
+    """Get same-day/latest intraday price for display and EMA-distance calculations.
+    Falls back to daily history when Yahoo has no intraday data.
+    Yahoo quotes can still be delayed; this avoids using an old daily close when a newer
+    same-day bar is available.
+    """
+    tickers = list(dict.fromkeys(tickers))
+    out = {}
+    chunks = [tickers[i:i + batch_size] for i in range(0, len(tickers), batch_size)]
+
+    def one(chunk):
+        try:
+            data = yf.download(
+                tickers=chunk, period="5d", interval="15m", auto_adjust=False,
+                progress=False, threads=True, group_by="column", prepost=False
+            )
+            return chunk, data
+        except Exception:
+            return chunk, None
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(one, c) for c in chunks]
+        for fut in as_completed(futures):
+            chunk, data = fut.result()
+            if data is None or data.empty:
+                continue
+            if isinstance(data.columns, pd.MultiIndex):
+                for ticker in chunk:
+                    try:
+                        sub = data.xs(ticker, axis=1, level=1, drop_level=True)
+                    except Exception:
+                        try:
+                            sub = data[ticker]
+                        except Exception:
+                            continue
+                    if "Close" in sub.columns:
+                        c = pd.to_numeric(sub["Close"], errors="coerce").dropna()
+                        if not c.empty:
+                            out[ticker] = float(c.iloc[-1])
+            else:
+                if len(chunk) == 1 and "Close" in data.columns:
+                    c = pd.to_numeric(data["Close"], errors="coerce").dropna()
+                    if not c.empty:
+                        out[chunk[0]] = float(c.iloc[-1])
+    return out
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def technical_scan(symbols, batch_size=100, workers=4):
     symbols = [str(x).strip().upper() for x in symbols]
@@ -293,11 +342,12 @@ def technical_scan(symbols, batch_size=100, workers=4):
     first_tickers = list(ticker_to_symbol.keys())
     # Download in batches.
     hist_map = batch_download(first_tickers, batch_size, workers)
+    intraday_map = latest_intraday_prices(first_tickers, max(25, min(int(batch_size), 75)), workers)
     results = []
     for sym in symbols:
         t = primary[sym]
         hist = hist_map.get(t)
-        row = calc_technical(sym, t, hist) if hist is not None else None
+        row = calc_technical(sym, t, hist, intraday_map.get(t)) if hist is not None else None
         if row is not None:
             results.append(row)
         elif not sym.isdigit() and not sym.endswith(".BO"):
@@ -307,10 +357,11 @@ def technical_scan(symbols, batch_size=100, workers=4):
     if fallback_needed:
         fallback_tickers = [s + ".BO" for s in fallback_needed]
         fallback_map = batch_download(fallback_tickers, batch_size, workers)
+        fallback_intraday = latest_intraday_prices(fallback_tickers, max(25, min(int(batch_size), 75)), workers)
         existing = {r["NSE Symbol"]: r for r in results}
         for sym in fallback_needed:
             t = sym + ".BO"
-            row = calc_technical(sym, t, fallback_map.get(t)) if t in fallback_map else None
+            row = calc_technical(sym, t, fallback_map.get(t), fallback_intraday.get(t)) if t in fallback_map else None
             if row is not None:
                 existing[sym] = row
             elif sym not in existing:
@@ -421,7 +472,7 @@ if st.button("🚀 RUN V6 — SCAN 1000+ STOCKS", type="primary", use_container_
 
     display_cols = [c for c in [
         "Company", "NSE Symbol", "Exchange", "Yahoo Ticker", "Fundamental Pass",
-        "Price", "200 EMA", "EMA Distance %", "Above 200 EMA", "RSI 14",
+        "Price", "Historical Close", "200 EMA", "EMA Distance %", "Above 200 EMA", "RSI 14",
         "Volume/20D", "5D %", "20D %", "Swing Score", "Technical Status",
         "Technical Pass", "Final Pass"
     ] if c in out.columns]
