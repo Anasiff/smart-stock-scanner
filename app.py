@@ -10,37 +10,12 @@ import time
 st.set_page_config(page_title="Smart Stock Scanner", page_icon="📈", layout="wide")
 
 st.title("📈 Smart Stock Scanner")
-st.caption("NSE • Fundamental filters + 200 EMA • Designed for BTST / 2–4 day swing research")
+st.caption("NSE • Fundamentals + 200 EMA • BTST / 2–4 day swing research")
 
-# -----------------------------
-# Helpers
-# -----------------------------
-@st.cache_data(ttl=86400, show_spinner=False)
-def load_nse_universe():
-    urls = [
-        "https://archives.nseindia.com/content/equities/EQUITY_L.csv",
-        "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv",
-    ]
-    for url in urls:
-        try:
-            df = pd.read_csv(url)
-            if "SYMBOL" in df.columns:
-                cols = ["SYMBOL"]
-                if "NAME OF COMPANY" in df.columns:
-                    cols.append("NAME OF COMPANY")
-                df = df[cols].copy()
-                df.columns = ["symbol", "company"] if len(cols) == 2 else ["symbol"]
-                if "company" not in df:
-                    df["company"] = df["symbol"]
-                df["symbol"] = df["symbol"].astype(str).str.strip()
-                df["ticker"] = df["symbol"] + ".NS"
-                return df.drop_duplicates("symbol")[["symbol", "company", "ticker"]]
-        except Exception:
-            continue
-    return pd.DataFrame(columns=["symbol", "company", "ticker"])
-
-
-def clean_num(x):
+# =========================================================
+# Generic helpers
+# =========================================================
+def num(x):
     try:
         if x is None or pd.isna(x):
             return np.nan
@@ -48,14 +23,45 @@ def clean_num(x):
     except Exception:
         return np.nan
 
-
-def pct_value(x):
-    """Convert Yahoo decimal percentages such as 0.55 -> 55."""
-    x = clean_num(x)
+def pct(x):
+    x = num(x)
     if pd.isna(x):
         return np.nan
     return x * 100 if abs(x) <= 2 else x
 
+def first_valid(df, names):
+    if df is None or df.empty:
+        return np.nan, None
+    for name in names:
+        if name in df.index:
+            s = pd.to_numeric(df.loc[name], errors="coerce").dropna()
+            if len(s):
+                return float(s.iloc[0]), name
+    return np.nan, None
+
+def first_two_valid(df, names):
+    if df is None or df.empty:
+        return [], None
+    for name in names:
+        if name in df.index:
+            s = pd.to_numeric(df.loc[name], errors="coerce").dropna()
+            if len(s) >= 2:
+                return [float(s.iloc[0]), float(s.iloc[1])], name
+    return [], None
+
+def latest_yoy(df, names):
+    """Latest available quarter compared with ~4 quarters earlier."""
+    if df is None or df.empty:
+        return np.nan, None
+    for name in names:
+        if name in df.index:
+            s = pd.to_numeric(df.loc[name], errors="coerce").dropna()
+            if len(s) >= 5:
+                latest = float(s.iloc[0])
+                prior = float(s.iloc[4])
+                if prior != 0:
+                    return (latest / prior - 1) * 100, name
+    return np.nan, None
 
 def get_200_ema(close):
     close = pd.Series(close).dropna()
@@ -63,371 +69,501 @@ def get_200_ema(close):
         return np.nan
     return float(close.ewm(span=200, adjust=False).mean().iloc[-1])
 
-
 def calc_rsi(close, period=14):
     close = pd.Series(close).dropna()
     if len(close) < period + 1:
         return np.nan
-    delta = close.diff()
-    gain = delta.clip(lower=0).rolling(period).mean()
-    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    d = close.diff()
+    gain = d.clip(lower=0).rolling(period).mean()
+    loss = (-d.clip(upper=0)).rolling(period).mean()
     rs = gain / loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else np.nan
+    x = 100 - (100 / (1 + rs))
+    return float(x.iloc[-1]) if pd.notna(x.iloc[-1]) else np.nan
 
 
-def price_scan(tickers, batch_size=80):
-    """Batch-download prices first. This avoids 1 API request per stock for history."""
-    rows = {}
-    for start in range(0, len(tickers), batch_size):
-        batch = tickers[start:start + batch_size]
+# =========================================================
+# NSE universe
+# =========================================================
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_nse():
+    for url in [
+        "https://archives.nseindia.com/content/equities/EQUITY_L.csv",
+        "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv",
+    ]:
         try:
-            data = yf.download(
-                batch,
-                period="1y",
-                interval="1d",
-                auto_adjust=False,
-                progress=False,
-                group_by="ticker",
-                threads=True,
+            d = pd.read_csv(url)
+            if "SYMBOL" not in d.columns:
+                continue
+            out = pd.DataFrame({
+                "symbol": d["SYMBOL"].astype(str).str.strip(),
+                "company": d["NAME OF COMPANY"].astype(str).str.strip()
+                    if "NAME OF COMPANY" in d.columns else d["SYMBOL"].astype(str),
+            })
+            out["ticker"] = out["symbol"] + ".NS"
+            return out.drop_duplicates("symbol")
+        except Exception:
+            pass
+    return pd.DataFrame(columns=["symbol", "company", "ticker"])
+
+
+# =========================================================
+# Batch price / EMA
+# =========================================================
+def scan_prices(tickers, batch=80):
+    result = {}
+    for i in range(0, len(tickers), batch):
+        group = tickers[i:i+batch]
+        try:
+            d = yf.download(
+                group, period="1y", interval="1d",
+                auto_adjust=False, progress=False,
+                group_by="ticker", threads=True
             )
-            if data is None or data.empty:
+            if d is None or d.empty:
                 continue
 
-            for ticker in batch:
+            for t in group:
                 try:
-                    if len(batch) == 1:
-                        close = data["Close"].dropna()
-                        volume = data["Volume"].dropna() if "Volume" in data else pd.Series(dtype=float)
+                    if len(group) == 1:
+                        close = d["Close"].dropna()
+                        vol = d["Volume"].dropna()
                     else:
-                        if ticker not in data.columns.get_level_values(0):
+                        if t not in d.columns.get_level_values(0):
                             continue
-                        close = data[ticker]["Close"].dropna()
-                        volume = data[ticker]["Volume"].dropna() if "Volume" in data[ticker] else pd.Series(dtype=float)
+                        close = d[t]["Close"].dropna()
+                        vol = d[t]["Volume"].dropna()
 
                     if len(close) < 210:
                         continue
-
                     price = float(close.iloc[-1])
-                    ema200 = get_200_ema(close)
-                    if pd.isna(ema200):
+                    ema = get_200_ema(close)
+                    if pd.isna(ema):
                         continue
-
-                    avg20 = float(volume.tail(20).mean()) if len(volume) else np.nan
-                    last_vol = float(volume.iloc[-1]) if len(volume) else np.nan
-                    vol_ratio = last_vol / avg20 if avg20 > 0 else np.nan
-
-                    rows[ticker] = {
+                    avg20 = float(vol.tail(20).mean()) if len(vol) else np.nan
+                    lastv = float(vol.iloc[-1]) if len(vol) else np.nan
+                    result[t] = {
                         "Price": price,
-                        "200 EMA": ema200,
-                        "Above 200 EMA %": (price - ema200) / ema200 * 100,
+                        "200 EMA": ema,
+                        "Above 200 EMA %": (price-ema)/ema*100,
                         "RSI 14": calc_rsi(close),
-                        "Volume / 20D Avg": vol_ratio,
+                        "Volume / 20D Avg": lastv/avg20 if avg20 > 0 else np.nan,
                         "Last Data": close.index[-1].strftime("%Y-%m-%d"),
                     }
                 except Exception:
                     continue
         except Exception:
-            # One failed batch should not kill the complete scan.
             continue
-    return rows
+    return result
 
 
-def get_fundamentals(row, price_data, retries=2):
-    """Fetch fundamentals with retry. Missing fields are reported, not silently rejected."""
-    ticker = row["ticker"]
-    for attempt in range(retries + 1):
+# =========================================================
+# Fundamental extraction
+# =========================================================
+@st.cache_data(ttl=21600, show_spinner=False)
+def fundamentals(ticker):
+    """
+    Build fundamentals from multiple Yahoo sources.
+
+    Priority:
+      1) info/default statistics for valuation/EPS/promoter
+      2) quarterly statements for latest-quarter YoY growth
+      3) balance sheet for ROE and Debt/Equity
+      4) fallback to info where available
+
+    This deliberately exposes source fields so a result is auditable.
+    """
+    try:
+        t = yf.Ticker(ticker)
+        info = {}
         try:
-            t = yf.Ticker(ticker)
             info = t.info or {}
-
-            pe = clean_num(info.get("trailingPE"))
-            eps = clean_num(info.get("trailingEps"))
-            roe = pct_value(info.get("returnOnEquity"))
-            profit_growth = pct_value(info.get("earningsGrowth"))
-            sales_growth = pct_value(info.get("revenueGrowth"))
-            debt_equity_raw = clean_num(info.get("debtToEquity"))
-            promoter = pct_value(info.get("heldPercentInsiders"))
-
-            # Yahoo's debtToEquity is normally a percentage-like number
-            # (e.g. 35.0 = 0.35 ratio), while some feeds may already return a ratio.
-            if pd.notna(debt_equity_raw):
-                debt_equity = debt_equity_raw / 100 if debt_equity_raw > 10 else debt_equity_raw
-            else:
-                debt_equity = np.nan
-
-            p = price_data
-            result = {
-                "Company": row["company"],
-                "NSE Symbol": row["symbol"],
-                "Price": p["Price"],
-                "P/E": pe,
-                "ROE %": roe,
-                "EPS": eps,
-                "Profit Growth %": profit_growth,
-                "Sales Growth %": sales_growth,
-                "Debt/Equity": debt_equity,
-                "Promoter/Insider %": promoter,
-                "200 EMA": p["200 EMA"],
-                "Above 200 EMA %": p["Above 200 EMA %"],
-                "RSI 14": p["RSI 14"],
-                "Volume / 20D Avg": p["Volume / 20D Avg"],
-                "Last Data": p["Last Data"],
-                "_ticker": ticker,
-            }
-
-            # Keep the result even when fundamentals are missing so the UI can
-            # show exactly which field is unavailable.
-            return result
         except Exception:
-            if attempt < retries:
-                time.sleep(0.8 * (attempt + 1))
-            else:
-                return None
-    return None
+            info = {}
+
+        # ---------- Fast quote/info fields ----------
+        pe = num(info.get("trailingPE"))
+        eps = num(info.get("trailingEps"))
+        promoter = pct(info.get("heldPercentInsiders"))
+
+        # ---------- Statements ----------
+        qinc = pd.DataFrame()
+        qbs = pd.DataFrame()
+        try:
+            qinc = t.get_income_stmt(freq="quarterly")
+        except Exception:
+            try:
+                qinc = t.quarterly_income_stmt
+            except Exception:
+                pass
+
+        try:
+            qbs = t.get_balance_sheet(freq="quarterly")
+        except Exception:
+            try:
+                qbs = t.quarterly_balance_sheet
+            except Exception:
+                pass
+
+        # Annual balance sheet fallback
+        absheet = pd.DataFrame()
+        try:
+            absheet = t.get_balance_sheet(freq="yearly")
+        except Exception:
+            try:
+                absheet = t.balance_sheet
+            except Exception:
+                pass
+
+        # ---------- Profit + sales growth: latest quarter YoY ----------
+        profit_growth, profit_row = latest_yoy(
+            qinc,
+            [
+                "Net Income Common Stockholders",
+                "Net Income",
+                "Net Income Including Noncontrolling Interests",
+            ],
+        )
+        sales_growth, sales_row = latest_yoy(
+            qinc,
+            [
+                "Total Revenue",
+                "Operating Revenue",
+                "Total Revenues",
+            ],
+        )
+
+        # Fallback to Yahoo info growth fields
+        if pd.isna(profit_growth):
+            profit_growth = pct(info.get("earningsGrowth"))
+            profit_source = "Yahoo info earningsGrowth" if pd.notna(profit_growth) else None
+        else:
+            profit_source = f"quarterly_income_stmt:{profit_row} YoY"
+
+        if pd.isna(sales_growth):
+            sales_growth = pct(info.get("revenueGrowth"))
+            sales_source = "Yahoo info revenueGrowth" if pd.notna(sales_growth) else None
+        else:
+            sales_source = f"quarterly_income_stmt:{sales_row} YoY"
+
+        # ---------- ROE: TTM-ish/latest income divided by avg equity ----------
+        # Prefer latest annual/quarterly balance values. Use average of latest
+        # two equity observations when available.
+        equity_vals, equity_row = first_two_valid(
+            qbs,
+            [
+                "Stockholders Equity",
+                "Common Stock Equity",
+                "Total Equity Gross Minority Interest",
+                "Total Equity",
+            ],
+        )
+        equity_source = "quarterly_balance_sheet"
+        if len(equity_vals) < 2:
+            equity_vals, equity_row = first_two_valid(
+                absheet,
+                [
+                    "Stockholders Equity",
+                    "Common Stock Equity",
+                    "Total Equity Gross Minority Interest",
+                    "Total Equity",
+                ],
+            )
+            equity_source = "annual_balance_sheet"
+
+        net_income_vals, ni_row = first_two_valid(
+            qinc,
+            [
+                "Net Income Common Stockholders",
+                "Net Income",
+                "Net Income Including Noncontrolling Interests",
+            ],
+        )
+
+        roe = np.nan
+        roe_source = None
+
+        if equity_vals and len(net_income_vals):
+            # Latest-quarter annualization when only quarterly statements exist.
+            # If four quarters are available, use TTM net income / average equity.
+            for name in [
+                "Net Income Common Stockholders",
+                "Net Income",
+                "Net Income Including Noncontrolling Interests",
+            ]:
+                if name in qinc.index:
+                    s = pd.to_numeric(qinc.loc[name], errors="coerce").dropna()
+                    if len(s) >= 4 and len(equity_vals) >= 2:
+                        ttm_ni = float(s.iloc[:4].sum())
+                        avg_eq = float(np.mean(equity_vals[:2]))
+                        if avg_eq > 0:
+                            roe = ttm_ni / avg_eq * 100
+                            roe_source = f"TTM {name} / avg equity"
+                            break
+
+        if pd.isna(roe):
+            roe = pct(info.get("returnOnEquity"))
+            roe_source = "Yahoo info returnOnEquity" if pd.notna(roe) else None
+
+        # ---------- Debt / Equity ----------
+        debt, debt_row = first_valid(
+            qbs,
+            [
+                "Total Debt",
+                "TotalDebt",
+            ],
+        )
+        equity, eq_row = first_valid(
+            qbs,
+            [
+                "Stockholders Equity",
+                "Common Stock Equity",
+                "Total Equity Gross Minority Interest",
+                "Total Equity",
+            ],
+        )
+
+        de = np.nan
+        de_source = None
+        if pd.notna(debt) and pd.notna(equity) and equity > 0:
+            de = debt / equity
+            de_source = f"quarterly_balance_sheet:{debt_row}/{eq_row}"
+
+        if pd.isna(de):
+            debt_raw = num(info.get("debtToEquity"))
+            if pd.notna(debt_raw):
+                de = debt_raw / 100 if debt_raw > 10 else debt_raw
+                de_source = "Yahoo info debtToEquity"
+
+        # ---------- EPS fallback ----------
+        if pd.isna(eps):
+            eps, eps_row = first_valid(
+                qinc,
+                ["Diluted EPS", "Basic EPS", "Diluted EPS Other GAAP"],
+            )
+        else:
+            eps_row = "Yahoo info trailingEps"
+
+        return {
+            "P/E": pe,
+            "ROE %": roe,
+            "EPS": eps,
+            "Profit Growth %": profit_growth,
+            "Sales Growth %": sales_growth,
+            "Debt/Equity": de,
+            "Promoter/Insider %": promoter,
+            "ROE Source": roe_source,
+            "Profit Growth Source": profit_source,
+            "Sales Growth Source": sales_source,
+            "Debt/Equity Source": de_source,
+            "EPS Source": eps_row if isinstance(eps_row, str) else "quarterly income statement",
+        }
+    except Exception as e:
+        return {
+            "P/E": np.nan, "ROE %": np.nan, "EPS": np.nan,
+            "Profit Growth %": np.nan, "Sales Growth %": np.nan,
+            "Debt/Equity": np.nan, "Promoter/Insider %": np.nan,
+            "ROE Source": None, "Profit Growth Source": None,
+            "Sales Growth Source": None, "Debt/Equity Source": None,
+            "EPS Source": None,
+        }
 
 
-def filter_state(r, filters):
-    checks = {
-        "P/E": pd.notna(r["P/E"]) and r["P/E"] < filters["pe"],
-        "ROE": pd.notna(r["ROE %"]) and r["ROE %"] > filters["roe"],
-        "EPS": pd.notna(r["EPS"]) and r["EPS"] > filters["eps"],
-        "Profit Growth": pd.notna(r["Profit Growth %"]) and r["Profit Growth %"] > filters["profit"],
-        "Sales Growth": pd.notna(r["Sales Growth %"]) and r["Sales Growth %"] > filters["sales"],
-        "Debt/Equity": pd.notna(r["Debt/Equity"]) and r["Debt/Equity"] < filters["de"],
-        "Promoter/Insider": pd.notna(r["Promoter/Insider %"]) and r["Promoter/Insider %"] > filters["promoter"],
+def make_row(meta, p, f):
+    r = {
+        "Company": meta["company"],
+        "NSE Symbol": meta["symbol"],
+        "Price": p["Price"],
+        "P/E": f["P/E"],
+        "ROE %": f["ROE %"],
+        "EPS": f["EPS"],
+        "Profit Growth %": f["Profit Growth %"],
+        "Sales Growth %": f["Sales Growth %"],
+        "Debt/Equity": f["Debt/Equity"],
+        "Promoter/Insider %": f["Promoter/Insider %"],
+        "200 EMA": p["200 EMA"],
+        "Above 200 EMA %": p["Above 200 EMA %"],
+        "RSI 14": p["RSI 14"],
+        "Volume / 20D Avg": p["Volume / 20D Avg"],
+        "Last Data": p["Last Data"],
+        "ROE Source": f["ROE Source"],
+        "Profit Growth Source": f["Profit Growth Source"],
+        "Sales Growth Source": f["Sales Growth Source"],
+        "Debt/Equity Source": f["Debt/Equity Source"],
+        "EPS Source": f["EPS Source"],
+    }
+    return r
+
+
+def checks(r, cfg):
+    return {
+        "P/E": pd.notna(r["P/E"]) and r["P/E"] < cfg["pe"],
+        "ROE": pd.notna(r["ROE %"]) and r["ROE %"] > cfg["roe"],
+        "EPS": pd.notna(r["EPS"]) and r["EPS"] > cfg["eps"],
+        "Profit Growth": pd.notna(r["Profit Growth %"]) and r["Profit Growth %"] > cfg["profit"],
+        "Sales Growth": pd.notna(r["Sales Growth %"]) and r["Sales Growth %"] > cfg["sales"],
+        "Debt/Equity": pd.notna(r["Debt/Equity"]) and r["Debt/Equity"] < cfg["de"],
+        "Promoter/Insider": pd.notna(r["Promoter/Insider %"]) and r["Promoter/Insider %"] > cfg["promoter"],
         "Price > 200 EMA": pd.notna(r["Price"]) and pd.notna(r["200 EMA"]) and r["Price"] > r["200 EMA"],
     }
-    return checks
 
 
-def passes(r, filters):
-    return all(filter_state(r, filters).values())
-
-
-def score(r):
-    def n(x):
+def smart_score(r):
+    def z(x):
         return 0 if pd.isna(x) else x
     s = 0
-    s += min(max((n(r["ROE %"]) - 25) / 50, 0), 1) * 15
-    s += min(max((n(r["Profit Growth %"]) - 50) / 150, 0), 1) * 20
-    s += min(max((n(r["Sales Growth %"]) - 50) / 150, 0), 1) * 20
-    s += min(max((30 - n(r["P/E"])) / 25, 0), 1) * 10
-    s += min(max((0.5 - n(r["Debt/Equity"])) / 0.5, 0), 1) * 10
-    s += min(max((n(r["Promoter/Insider %"]) - 50) / 40, 0), 1) * 10
-    s += min(max(n(r["Above 200 EMA %"]) / 30, 0), 1) * 15
-    return round(s, 1)
+    s += min(max((z(r["ROE %"])-25)/50,0),1)*15
+    s += min(max((z(r["Profit Growth %"])-50)/150,0),1)*20
+    s += min(max((z(r["Sales Growth %"])-50)/150,0),1)*20
+    s += min(max((30-z(r["P/E"]))/25,0),1)*10
+    s += min(max((0.5-z(r["Debt/Equity"]))/0.5,0),1)*10
+    s += min(max((z(r["Promoter/Insider %"])-50)/40,0),1)*10
+    s += min(max(z(r["Above 200 EMA %"])/30,0),1)*15
+    return round(s,1)
 
 
-# -----------------------------
-# Sidebar
-# -----------------------------
-st.sidebar.header("Screening Filters")
-
-pe = st.sidebar.number_input("P/E < ", min_value=0.0, value=30.0, step=1.0)
-roe = st.sidebar.number_input("ROE % > ", min_value=-100.0, value=25.0, step=1.0)
-eps = st.sidebar.number_input("EPS > ", value=0.0, step=1.0)
-profit = st.sidebar.number_input("Profit Growth % > ", value=50.0, step=5.0)
-sales = st.sidebar.number_input("Sales Growth % > ", value=50.0, step=5.0)
-de = st.sidebar.number_input("Debt/Equity < ", min_value=0.0, value=0.5, step=0.1)
-promoter = st.sidebar.number_input("Promoter/Insider % > ", min_value=0.0, value=50.0, step=5.0)
+# =========================================================
+# UI
+# =========================================================
+st.sidebar.header("Hard Filters")
+pe = st.sidebar.number_input("P/E <", 0.0, 500.0, 30.0, 1.0)
+roe = st.sidebar.number_input("ROE % >", -100.0, 500.0, 25.0, 1.0)
+eps = st.sidebar.number_input("EPS >", -100000.0, 100000.0, 0.0, 1.0)
+profit = st.sidebar.number_input("Profit Growth % >", -500.0, 1000.0, 50.0, 5.0)
+sales = st.sidebar.number_input("Sales Growth % >", -500.0, 1000.0, 50.0, 5.0)
+de = st.sidebar.number_input("Debt/Equity <", 0.0, 20.0, 0.5, 0.1)
+promoter = st.sidebar.number_input("Promoter/Insider % >", 0.0, 100.0, 50.0, 5.0)
 
 st.sidebar.divider()
 max_stocks = st.sidebar.slider("Maximum stocks to scan", 100, 2500, 1000, 100)
-workers = st.sidebar.slider("Parallel fundamental requests", 1, 8, 3)
-
-st.sidebar.divider()
-st.sidebar.subheader("Swing extras")
+workers = st.sidebar.slider("Parallel fundamental requests", 1, 5, 3)
 min_rsi = st.sidebar.number_input("Optional RSI minimum", 0.0, 100.0, 0.0, 1.0)
-min_vol = st.sidebar.number_input("Optional volume / 20D average", 0.0, 20.0, 0.0, 0.1)
+min_vol = st.sidebar.number_input("Optional volume / 20D avg", 0.0, 20.0, 0.0, 0.1)
 
-filters = {
-    "pe": pe, "roe": roe, "eps": eps, "profit": profit,
-    "sales": sales, "de": de, "promoter": promoter
-}
+cfg = {"pe":pe,"roe":roe,"eps":eps,"profit":profit,"sales":sales,"de":de,"promoter":promoter}
 
-# -----------------------------
-# Universe
-# -----------------------------
+nse = load_nse()
 st.subheader("Universe")
-nse = load_nse_universe()
-
 if nse.empty:
-    st.error("Could not download the NSE equity list right now. You can upload a CSV with columns: symbol, company.")
+    st.error("NSE universe could not be loaded.")
     st.stop()
 
 st.success(f"NSE universe loaded: {len(nse):,} symbols")
 
-uploaded = st.file_uploader("Optional: upload your own universe CSV (symbol, company, ticker)", type=["csv"])
-if uploaded:
+upload = st.file_uploader("Optional custom universe CSV (symbol, company, ticker)", type=["csv"])
+if upload:
     try:
-        custom = pd.read_csv(uploaded)
-        required = {"symbol", "company"}
-        if not required.issubset(custom.columns):
-            st.error("CSV needs at least: symbol, company")
+        custom = pd.read_csv(upload)
+        if not {"symbol","company"}.issubset(custom.columns):
+            st.error("CSV requires symbol and company columns.")
         else:
             if "ticker" not in custom.columns:
-                custom["ticker"] = custom["symbol"].astype(str).str.strip() + ".NS"
-            nse = custom[["symbol", "company", "ticker"]].copy()
+                custom["ticker"] = custom["symbol"].astype(str).str.strip()+".NS"
+            nse = custom[["symbol","company","ticker"]]
             st.success(f"Custom universe loaded: {len(nse):,}")
     except Exception as e:
         st.error(f"CSV error: {e}")
 
-universe = nse.head(max_stocks).copy()
-
 st.info(
-    "Free Yahoo Finance data is used for market/fundamental fields. "
-    "Promoter/Insider is only a Yahoo proxy and is NOT guaranteed to equal NSE/BSE promoter holding. "
-    "Missing fundamentals are now shown as missing instead of silently eliminating the stock."
+    "V3 uses Yahoo financial statements as a fallback/primary calculation source for ROE, "
+    "latest-quarter YoY profit/sales growth and Debt/Equity. Yahoo insider holding remains only a proxy "
+    "for promoter holding and is not official NSE/BSE shareholding."
 )
 
 if st.button("🔎 RUN FULL SCAN", type="primary", use_container_width=True):
-    if universe.empty:
-        st.error("No stocks available to scan.")
-        st.stop()
-
-    # Phase 1: batch price/EMA scan for the selected universe.
-    st.write("### Phase 1/2 — Price + 200 EMA scan")
+    universe = nse.head(max_stocks).copy()
     tickers = universe["ticker"].tolist()
-    price_map = price_scan(tickers)
 
-    # Only fetch expensive fundamentals for stocks with usable 200 EMA data.
-    price_candidates = []
-    for _, row in universe.iterrows():
-        if row["ticker"] in price_map:
-            price_candidates.append((row, price_map[row["ticker"]]))
+    st.write("### Phase 1/2 — Price + 200 EMA")
+    price_map = scan_prices(tickers)
+    candidates = [(row, price_map[row["ticker"]]) for _, row in universe.iterrows() if row["ticker"] in price_map]
+    st.success(f"Usable price history: {len(candidates):,} / {len(universe):,}")
 
-    st.success(f"Price history available for {len(price_candidates):,} / {len(universe):,} stocks")
-
-    if not price_candidates:
-        st.error("Yahoo Finance returned no usable daily history. Try again later; this is a data-provider issue, not a 'zero stocks qualify' result.")
+    if not candidates:
+        st.error("No usable price history returned by Yahoo. Try again later.")
         st.stop()
 
-    # Phase 2: fundamentals with low parallelism to reduce Yahoo rate limiting.
-    st.write("### Phase 2/2 — Fundamental data scan")
-    results = []
-    failures = 0
+    st.write("### Phase 2/2 — Fundamental reconstruction")
     progress = st.progress(0)
     status = st.empty()
+    results = []
+    failures = 0
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {
-            ex.submit(get_fundamentals, row, pdata): row["symbol"]
-            for row, pdata in price_candidates
+            ex.submit(fundamentals, row["ticker"]): (row, price_map[row["ticker"]])
+            for row, _ in candidates
         }
-        done = 0
-        for fut in as_completed(futures):
-            done += 1
-            symbol = futures[fut]
-            status.write(f"Fetching fundamentals {done}/{len(futures)}: {symbol}")
-            progress.progress(done / len(futures))
+        total = len(futures)
+        for done, fut in enumerate(as_completed(futures), 1):
+            row, p = futures[fut]
+            status.write(f"Reconstructing fundamentals {done}/{total}: {row['symbol']}")
+            progress.progress(done/total)
             try:
-                r = fut.result()
-                if r is None:
-                    failures += 1
-                else:
-                    results.append(r)
+                f = fut.result()
+                results.append(make_row(row, p, f))
             except Exception:
                 failures += 1
 
     progress.empty()
     status.empty()
 
-    st.info(f"Fundamental records received: {len(results):,} | Provider failures: {failures:,}")
+    df_all = pd.DataFrame(results)
+    st.info(f"Fundamental records: {len(df_all):,} | Failures: {failures:,}")
 
-    if not results:
-        st.error("No fundamental records were returned by Yahoo Finance. Try again later or reduce parallel requests to 1.")
-        st.stop()
+    # Diagnostics
+    diag = []
+    for label in ["P/E","ROE","EPS","Profit Growth","Sales Growth","Debt/Equity","Promoter/Insider","Price > 200 EMA"]:
+        n = sum(checks(r,cfg).get(label,False) for _,r in df_all.iterrows())
+        diag.append({"Filter":label,"Passed":n,"Total":len(df_all)})
+    st.subheader("Filter diagnostics")
+    st.dataframe(pd.DataFrame(diag), hide_index=True, use_container_width=True)
 
-    all_df = pd.DataFrame(results)
+    # Missing data
+    miss_fields = ["P/E","ROE %","EPS","Profit Growth %","Sales Growth %","Debt/Equity","Promoter/Insider %"]
+    miss = df_all[miss_fields].isna().sum().reset_index()
+    miss.columns = ["Field","Missing records"]
+    with st.expander("Data availability / missing fields"):
+        st.dataframe(miss, hide_index=True, use_container_width=True)
 
-    # Diagnostic: count how many stocks survive each individual hard filter.
-    st.write("### Filter diagnostics")
-    diagnostics = []
-    for name in ["P/E", "ROE", "EPS", "Profit Growth", "Sales Growth", "Debt/Equity", "Promoter/Insider", "Price > 200 EMA"]:
-        count = 0
-        for _, r in all_df.iterrows():
-            if filter_state(r, filters).get(name, False):
-                count += 1
-        diagnostics.append({"Filter": name, "Passed": count, "Total records": len(all_df)})
-
-    diag_df = pd.DataFrame(diagnostics)
-    st.dataframe(diag_df, hide_index=True, use_container_width=True)
-
-    # Explicit missing-data report.
-    missing_cols = ["P/E", "ROE %", "EPS", "Profit Growth %", "Sales Growth %", "Debt/Equity", "Promoter/Insider %"]
-    missing = all_df[missing_cols].isna().sum().reset_index()
-    missing.columns = ["Field", "Missing records"]
-
-    with st.expander("Data availability (important)"):
-        st.dataframe(missing, hide_index=True, use_container_width=True)
-        st.caption(
-            "A missing Yahoo fundamental is not treated as a pass. It is shown here so a zero-result scan "
-            "cannot be mistaken for proof that no NSE stock qualifies."
-        )
-
+    # Final hard filter
     final = []
-    for _, r in all_df.iterrows():
-        if passes(r, filters):
-            if min_rsi > 0 and (pd.isna(r["RSI 14"]) or r["RSI 14"] < min_rsi):
-                continue
-            if min_vol > 0 and (pd.isna(r["Volume / 20D Avg"]) or r["Volume / 20D Avg"] < min_vol):
-                continue
-            r["Smart Score"] = score(r)
-            final.append(r)
+    for _, r in df_all.iterrows():
+        c = checks(r,cfg)
+        if not all(c.values()):
+            continue
+        if min_rsi > 0 and (pd.isna(r["RSI 14"]) or r["RSI 14"] < min_rsi):
+            continue
+        if min_vol > 0 and (pd.isna(r["Volume / 20D Avg"]) or r["Volume / 20D Avg"] < min_vol):
+            continue
+        r["Smart Score"] = smart_score(r)
+        final.append(r)
 
-    df = pd.DataFrame(final)
-    st.session_state["results"] = df
-    st.session_state["scan_time"] = datetime.now().strftime("%d %b %Y, %I:%M %p IST")
+    out = pd.DataFrame(final)
+    st.session_state["results_v3"] = out
 
-# -----------------------------
-# Results
-# -----------------------------
-if "results" in st.session_state:
-    df = st.session_state["results"]
-
+if "results_v3" in st.session_state:
+    out = st.session_state["results_v3"]
     st.divider()
-    if df.empty:
-        st.warning("No stock passed ALL hard filters with the available Yahoo data.")
+    if out.empty:
+        st.warning("No stock passed ALL hard filters with the available reconstructed data.")
     else:
-        df = df.sort_values(["Smart Score", "Above 200 EMA %"], ascending=False).reset_index(drop=True)
-        st.success(f"✅ Stocks Passing All Filters: {len(df)}")
-
-        show_cols = [
-            "Company", "NSE Symbol", "Price", "P/E", "ROE %",
-            "EPS", "Profit Growth %", "Sales Growth %",
-            "Debt/Equity", "Promoter/Insider %",
-            "200 EMA", "Above 200 EMA %", "RSI 14",
-            "Volume / 20D Avg", "Smart Score", "Last Data"
+        out = out.sort_values(["Smart Score","Above 200 EMA %"], ascending=False)
+        st.success(f"✅ {len(out)} stocks passed ALL hard filters")
+        cols = [
+            "Company","NSE Symbol","Price","P/E","ROE %","EPS",
+            "Profit Growth %","Sales Growth %","Debt/Equity",
+            "Promoter/Insider %","200 EMA","Above 200 EMA %",
+            "RSI 14","Volume / 20D Avg","Smart Score","Last Data"
         ]
-        out = df[show_cols].copy()
-
-        st.dataframe(
-            out,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Price": st.column_config.NumberColumn(format="₹%.2f"),
-                "P/E": st.column_config.NumberColumn(format="%.2f"),
-                "ROE %": st.column_config.NumberColumn(format="%.2f%%"),
-                "EPS": st.column_config.NumberColumn(format="₹%.2f"),
-                "Profit Growth %": st.column_config.NumberColumn(format="%.2f%%"),
-                "Sales Growth %": st.column_config.NumberColumn(format="%.2f%%"),
-                "Debt/Equity": st.column_config.NumberColumn(format="%.2f"),
-                "Promoter/Insider %": st.column_config.NumberColumn(format="%.2f%%"),
-                "200 EMA": st.column_config.NumberColumn(format="₹%.2f"),
-                "Above 200 EMA %": st.column_config.NumberColumn(format="%.2f%%"),
-                "RSI 14": st.column_config.NumberColumn(format="%.2f"),
-                "Volume / 20D Avg": st.column_config.NumberColumn(format="%.2fx"),
-                "Smart Score": st.column_config.NumberColumn(format="%.1f"),
-            }
+        st.dataframe(out[cols], hide_index=True, use_container_width=True)
+        st.download_button(
+            "⬇️ Download results CSV",
+            out[cols].to_csv(index=False).encode(),
+            "smart_stock_scanner_results.csv",
+            "text/csv"
         )
 
-        csv = out.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download results CSV", csv, "stock_screen_results.csv", "text/csv")
-
-st.divider()
 st.caption(
-    "Research tool only — not investment advice. Yahoo Finance data can be delayed, incomplete, rate-limited, "
-    "or inconsistent across securities. Verify financial/shareholding data independently."
+    "Research tool only — not investment advice. Yahoo Finance can be incomplete or rate-limited. "
+    "Verify financials and promoter/shareholding data independently."
 )
