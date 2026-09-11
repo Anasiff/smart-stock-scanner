@@ -11,7 +11,7 @@ from bs4 import BeautifulSoup
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Smart Stock Scanner V4", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Smart Stock Scanner V4.1", page_icon="📈", layout="wide")
 
 DEFAULT_SCREENER_URL = "https://www.screener.in/screens/3928301/cheetah/"
 DEFAULT_QUERY = (
@@ -20,11 +20,11 @@ DEFAULT_QUERY = (
     "Promoter holding > 50 AND Current price > DMA 200"
 )
 
-st.title("📈 Smart Stock Scanner V4")
+st.title("📈 Smart Stock Scanner V4.1")
 st.caption("Screener.in fundamentals + Yahoo Finance technicals • BTST / 2–4 day swing research")
 
 st.info(
-    "V4 changes the architecture: fundamental hard filters are taken from a public "
+    "V4.1 fixes Screener symbol extraction; fundamentals remain sourced from Screener: fundamental hard filters are taken from a public "
     "Screener.in screen instead of reconstructing ROE/growth/debt from Yahoo. "
     "Yahoo is used only for price/200 EMA/RSI/volume checks. No stock is invented "
     "when a source is unavailable."
@@ -74,27 +74,42 @@ def fetch_screener(url: str):
 
     rows = []
     table = soup.select_one("table.data-table")
+
     if table:
-        for tr in table.select("tbody tr"):
-            a = tr.select_one("td.name a")
+        # Screener's CSS classes can change. Extract the company link
+        # generically from each result row instead of relying on td.name.
+        for tr in table.select("tbody tr, tr"):
+            a = tr.select_one('a[href*="/company/"]')
             if not a:
                 continue
             name = a.get_text(" ", strip=True)
             href = a.get("href", "")
-            m = re.search(r"/company/([^/]+)/", href)
+            m = re.search(r"/company/([^/?#]+)/?", href)
             symbol = m.group(1).upper() if m else ""
-            cells = [td.get_text(" ", strip=True) for td in tr.select("td")]
-            rows.append({"Company": name, "NSE Symbol": symbol, "_cells": cells})
+            if symbol:
+                rows.append({"Company": name, "NSE Symbol": symbol})
 
-    # Fallback: parse pandas HTML if class names change.
+    # Fallback: collect company links directly from the whole page.
     if not rows:
-        tables = pd.read_html(io.StringIO(r.text))
-        for t in tables:
-            if "Company" in t.columns:
-                t = t.copy()
-                t["NSE Symbol"] = ""
-                rows = t.to_dict("records")
-                break
+        seen = set()
+        for a in soup.select('a[href*="/company/"]'):
+            href = a.get("href", "")
+            m = re.search(r"/company/([^/?#]+)/?", href)
+            if not m:
+                continue
+            symbol = m.group(1).upper()
+            name = a.get_text(" ", strip=True)
+            if symbol and name and symbol not in seen:
+                seen.add(symbol)
+                rows.append({"Company": name, "NSE Symbol": symbol})
+
+    if not rows:
+        raise ValueError(
+            "Screener result table was found, but NSE company links could not be extracted. "
+            "V4.1 stops here rather than sending zero/blank symbols to Yahoo. "
+            "Use a public Screener URL or upload a Screener CSV."
+        )
+
 
     if not rows:
         raise ValueError(
@@ -213,12 +228,15 @@ if source_url:
 
 # Clean and de-duplicate
 fund["NSE Symbol"] = fund["NSE Symbol"].astype(str).str.upper().str.strip()
+if fund.empty:
+    st.error("No NSE symbols were extracted from Screener. Scan stopped safely.")
+    st.stop()
 fund = fund[fund["NSE Symbol"].ne("") & fund["NSE Symbol"].ne("NAN")].drop_duplicates("NSE Symbol")
 fund = fund.head(int(max_candidates)).copy()
 
 st.write(f"**Candidates sent to Yahoo technical check: {len(fund)}**")
 
-if st.button("🔎 RUN V4 SCAN", type="primary", use_container_width=True):
+if st.button("🔎 RUN V4.1 SCAN", type="primary", use_container_width=True):
     with st.spinner("Checking price, 200 EMA, RSI and volume for Screener-qualified stocks..."):
         tech = technical_check(fund["NSE Symbol"].tolist())
 
@@ -235,7 +253,7 @@ if st.button("🔎 RUN V4 SCAN", type="primary", use_container_width=True):
 
     out = out.sort_values(["Technical Pass", "Above 200 EMA", "RSI 14"], ascending=[False, False, False])
 
-    st.subheader("V4 Results")
+    st.subheader("V4.1 Results")
     passed = out[out["Technical Pass"]].copy()
     st.success(f"{len(passed)} stocks passed the Screener fundamentals + selected technical filters.")
 
@@ -254,7 +272,7 @@ if st.button("🔎 RUN V4 SCAN", type="primary", use_container_width=True):
     )
 
     st.divider()
-    st.subheader("Why V4 is different")
+    st.subheader("Why V4.1 is different")
     st.write(
         "Fundamental qualification is delegated to the Screener screen instead of silently "
         "rejecting stocks because Yahoo returned missing ROE/growth/debt fields. Yahoo is only "
