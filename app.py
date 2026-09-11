@@ -11,23 +11,22 @@ from bs4 import BeautifulSoup
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Smart Stock Scanner V4.2", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Smart Stock Scanner V5", page_icon="📈", layout="wide")
 
-DEFAULT_SCREENER_URL = "https://www.screener.in/screens/3928301/cheetah/"
+DEFAULT_SCREENER_URL = "https://www.screener.in/screens/3635525/1/"
 DEFAULT_QUERY = (
     "Price to Earning < 30 AND Return on equity > 25 AND EPS > 0 AND "
     "Profit growth > 50 AND Sales growth > 50 AND Debt to equity < 0.5 AND "
-    "Promoter holding > 50 AND Current price > DMA 200"
+    "Promoter holding > 50"
 )
 
-st.title("📈 Smart Stock Scanner V4.2")
+st.title("📈 Smart Stock Scanner V5")
 st.caption("Screener.in fundamentals + Yahoo Finance technicals • BTST / 2–4 day swing research")
 
 st.info(
-    "V4.2 adds NSE/BSE-aware Yahoo tickers; fundamentals remain sourced from Screener: fundamental hard filters are taken from a public "
-    "Screener.in screen instead of reconstructing ROE/growth/debt from Yahoo. "
-    "Yahoo is used only for price/200 EMA/RSI/volume checks. No stock is invented "
-    "when a source is unavailable."
+    "V5 uses the exact 7 fundamental hard filters from a public Screener screen, then performs the 200 EMA/RSI/volume/momentum analysis itself. "
+    "The Screener 200-DMA condition is intentionally removed so the app can calculate the required 200 EMA locally. "
+    "NSE/BSE-aware Yahoo tickers are used for technical data; no fundamental value is invented or reconstructed from Yahoo."
 )
 
 with st.sidebar:
@@ -37,7 +36,7 @@ with st.sidebar:
         value=DEFAULT_SCREENER_URL,
         help="Paste any public Screener.in screen URL. The screen itself must contain your desired fundamental filters."
     )
-    st.caption("Default screen uses your original 8 hard filters.")
+    st.caption("Default screen uses your 7 fundamental hard filters. 200 EMA is calculated locally by V5.")
     st.divider()
 
     st.header("Technical filters")
@@ -45,14 +44,15 @@ with st.sidebar:
     min_rsi = st.number_input("Minimum RSI (optional)", min_value=0.0, max_value=100.0, value=0.0, step=1.0)
     max_rsi = st.number_input("Maximum RSI (optional)", min_value=0.0, max_value=100.0, value=100.0, step=1.0)
     min_volume_ratio = st.number_input("Min volume / 20D avg (optional)", min_value=0.0, max_value=20.0, value=0.0, step=0.1)
-    max_candidates = st.number_input("Max candidates for Yahoo technical check", min_value=1, max_value=100, value=50, step=1)
+    max_candidates = st.number_input("Max candidates for Yahoo technical check", min_value=1, max_value=100, value=100, step=1)
 
     st.divider()
-    st.header("Source diagnostics")
+    st.header("V5 source diagnostics")
     st.caption("Screener public pages do not provide an official API. V4 reads the public HTML page and parses the displayed result table. If the source blocks requests, use the CSV upload fallback below.")
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_screener(url: str):
+    """Fetch all public Screener result pages, not just page 1."""
     if "screener.in/screens/" not in url:
         raise ValueError("Please provide a public Screener.in screen URL.")
 
@@ -61,66 +61,79 @@ def fetch_screener(url: str):
                       "(KHTML, like Gecko) Chrome/131.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
     }
-    r = requests.get(url, headers=headers, timeout=25)
-    r.raise_for_status()
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    def fetch_page(page_no):
+        params = {} if page_no == 1 else {"page": page_no}
+        r = requests.get(url, headers=headers, params=params, timeout=25)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        return r, soup
+
+    r, soup = fetch_page(1)
     title = soup.title.get_text(" ", strip=True) if soup.title else "Screener screen"
-
     query = ""
     qnode = soup.select_one(".query-text, .query")
     if qnode:
         query = qnode.get_text(" ", strip=True)
 
-    rows = []
-    table = soup.select_one("table.data-table")
+    def parse_rows(soup):
+        rows = []
+        table = soup.select_one("table.data-table")
+        if table:
+            for tr in table.select("tbody tr, tr"):
+                a = tr.select_one('a[href*="/company/"]')
+                if not a:
+                    continue
+                name = a.get_text(" ", strip=True)
+                href = a.get("href", "")
+                m = re.search(r"/company/([^/?#]+)/?", href)
+                symbol = m.group(1).upper() if m else ""
+                if symbol:
+                    rows.append({"Company": name, "NSE Symbol": symbol})
+        if not rows:
+            seen = set()
+            for a in soup.select('a[href*="/company/"]'):
+                href = a.get("href", "")
+                m = re.search(r"/company/([^/?#]+)/?", href)
+                if not m:
+                    continue
+                symbol = m.group(1).upper()
+                name = a.get_text(" ", strip=True)
+                if symbol and name and symbol not in seen:
+                    seen.add(symbol)
+                    rows.append({"Company": name, "NSE Symbol": symbol})
+        return rows
 
-    if table:
-        # Screener's CSS classes can change. Extract the company link
-        # generically from each result row instead of relying on td.name.
-        for tr in table.select("tbody tr, tr"):
-            a = tr.select_one('a[href*="/company/"]')
-            if not a:
-                continue
-            name = a.get_text(" ", strip=True)
-            href = a.get("href", "")
-            m = re.search(r"/company/([^/?#]+)/?", href)
-            symbol = m.group(1).upper() if m else ""
-            if symbol:
-                rows.append({"Company": name, "NSE Symbol": symbol})
+    all_rows = []
+    seen_symbols = set()
+    max_pages = 20
+    page = 1
+    while page <= max_pages:
+        if page == 1:
+            page_rows = parse_rows(soup)
+        else:
+            rp, sp = fetch_page(page)
+            page_rows = parse_rows(sp)
+            if not page_rows:
+                break
+        added = 0
+        for row in page_rows:
+            sym = row["NSE Symbol"]
+            if sym not in seen_symbols:
+                seen_symbols.add(sym)
+                all_rows.append(row)
+                added += 1
+        if added == 0:
+            break
+        page += 1
 
-    # Fallback: collect company links directly from the whole page.
-    if not rows:
-        seen = set()
-        for a in soup.select('a[href*="/company/"]'):
-            href = a.get("href", "")
-            m = re.search(r"/company/([^/?#]+)/?", href)
-            if not m:
-                continue
-            symbol = m.group(1).upper()
-            name = a.get_text(" ", strip=True)
-            if symbol and name and symbol not in seen:
-                seen.add(symbol)
-                rows.append({"Company": name, "NSE Symbol": symbol})
-
-    if not rows:
+    if not all_rows:
         raise ValueError(
-            "Screener result table was found, but NSE company links could not be extracted. "
-            "V4.1 stops here rather than sending zero/blank symbols to Yahoo. "
+            "Screener result table was found, but company links could not be extracted. "
             "Use a public Screener URL or upload a Screener CSV."
         )
 
-
-    if not rows:
-        raise ValueError(
-            "Could not read the Screener result table. The page may be private, "
-            "blocked, or its HTML layout may have changed."
-        )
-
-    df = pd.DataFrame(rows)
-    if "_cells" in df.columns:
-        df = df.drop(columns=["_cells"])
-    return title, query, df, r.url
+    return title, query, pd.DataFrame(all_rows), r.url
 
 def load_uploaded_csv(uploaded):
     raw = pd.read_csv(uploaded)
@@ -172,9 +185,12 @@ def technical_check(symbols):
                 "Exchange": "BSE" if yahoo_symbol.endswith(".BO") else "NSE",
                 "Price": float(close.iloc[-1]) if len(close) else np.nan,
                 "200 EMA": np.nan,
+                "EMA Distance %": np.nan,
                 "Above 200 EMA": False,
                 "RSI 14": np.nan,
                 "Volume/20D": np.nan,
+                "5D %": np.nan,
+                "20D %": np.nan,
                 "Technical Status": "Insufficient history",
             }
 
@@ -194,6 +210,9 @@ def technical_check(symbols):
             if pd.notna(vol_avg.iloc[-1]) and vol_avg.iloc[-1]
             else np.nan
         )
+        ret_5d = float((close.iloc[-1] / close.iloc[-6] - 1) * 100) if len(close) >= 6 else np.nan
+        ret_20d = float((close.iloc[-1] / close.iloc[-21] - 1) * 100) if len(close) >= 21 else np.nan
+        ema_distance = float((last_price / last_ema - 1) * 100) if last_ema else np.nan
 
         return {
             "NSE Symbol": sym,
@@ -201,9 +220,12 @@ def technical_check(symbols):
             "Exchange": "BSE" if yahoo_symbol.endswith(".BO") else "NSE",
             "Price": last_price,
             "200 EMA": last_ema,
+            "EMA Distance %": ema_distance,
             "Above 200 EMA": last_price > last_ema,
             "RSI 14": last_rsi,
             "Volume/20D": last_vr,
+            "5D %": ret_5d,
+            "20D %": ret_20d,
             "Technical Status": "OK",
         }
 
@@ -235,9 +257,12 @@ def technical_check(symbols):
                 "Exchange": "BSE" if attempted and attempted[-1].endswith(".BO") else "NSE",
                 "Price": np.nan,
                 "200 EMA": np.nan,
+                "EMA Distance %": np.nan,
                 "Above 200 EMA": False,
                 "RSI 14": np.nan,
                 "Volume/20D": np.nan,
+                "5D %": np.nan,
+                "20D %": np.nan,
                 "Technical Status": "No Yahoo price data",
             }
         results.append(found)
@@ -305,34 +330,46 @@ if st.button("🔎 RUN V4.2 SCAN", type="primary", use_container_width=True):
     if min_volume_ratio > 0:
         out["Technical Pass"] &= out["Volume/20D"].ge(min_volume_ratio).fillna(False)
 
-    out = out.sort_values(["Technical Pass", "Above 200 EMA", "RSI 14"], ascending=[False, False, False])
+    # Transparent swing score: momentum + trend + participation, used only for ranking.
+    def clip_score(x, lo, hi):
+        if pd.isna(x):
+            return np.nan
+        return max(0.0, min(100.0, (x - lo) / (hi - lo) * 100.0))
 
-    st.subheader("V4.2 Results")
+    trend_score = out["EMA Distance %"].apply(lambda x: clip_score(x, 0, 20))
+    rsi_score = out["RSI 14"].apply(lambda x: 100 - abs(x - 55) * 2 if pd.notna(x) else np.nan).clip(lower=0, upper=100)
+    vol_score = out["Volume/20D"].apply(lambda x: clip_score(x, 0.7, 2.0))
+    momentum_score = out["5D %"].apply(lambda x: clip_score(x, -2, 8))
+    out["Swing Score"] = (0.35 * trend_score + 0.25 * rsi_score + 0.20 * vol_score + 0.20 * momentum_score).round(1)
+
+    out = out.sort_values(["Technical Pass", "Swing Score", "5D %"], ascending=[False, False, False], na_position="last")
+
+    st.subheader("V5 Results")
     passed = out[out["Technical Pass"]].copy()
-    st.success(f"{len(passed)} stocks passed the Screener fundamentals + selected technical filters.")
+    st.success(f"{len(passed)} stocks passed the 7 fundamental filters + selected technical filters.")
 
     display_cols = [c for c in [
         "Company", "NSE Symbol", "Exchange", "Yahoo Ticker",
-        "Price", "200 EMA", "Above 200 EMA",
-        "RSI 14", "Volume/20D", "Technical Pass"
+        "Price", "200 EMA", "EMA Distance %", "Above 200 EMA",
+        "RSI 14", "Volume/20D", "5D %", "20D %", "Swing Score", "Technical Pass"
     ] if c in out.columns]
     st.dataframe(out[display_cols], use_container_width=True, hide_index=True)
 
     st.download_button(
-        "⬇️ Download V4 results CSV",
+        "⬇️ Download V5 results CSV",
         out.to_csv(index=False).encode(),
-        "smart_stock_scanner_v4_results.csv",
+        "smart_stock_scanner_v5_results.csv",
         "text/csv",
         use_container_width=True,
     )
 
     st.divider()
-    st.subheader("Why V4.2 is different")
+    st.subheader("Why V5 is different")
     st.write(
-        "Fundamental qualification is delegated to the Screener screen instead of silently "
-        "rejecting stocks because Yahoo returned missing ROE/growth/debt fields. Yahoo is only "
-        "used for technical confirmation. If a source is unavailable, V4 reports the failure "
-        "instead of inventing or imputing a fundamental value."
+        "The 7 fundamental hard filters are delegated to the public Screener screen. V5 deliberately "
+        "removes Screener's DMA-200 condition because the app calculates the required 200 EMA itself. "
+        "All Screener result pages are collected, including page 2/3/etc. Yahoo is only used for "
+        "technical data. Missing source data is reported rather than invented."
     )
 
 st.caption(
