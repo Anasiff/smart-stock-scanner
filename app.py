@@ -21,7 +21,7 @@ DEFAULT_QUERY = (
 )
 
 st.title("📈 Smart Stock Scanner V6.2")
-st.caption("1000+ stock technical scan • exact 7 fundamental filters • robust Swing Score • BTST / 2–4 day swing research")
+st.caption("1000+ stock technical scan • exact 7 fundamental filters • robust 5-factor Swing Score • BTST / 2–4 day swing research")
 
 st.info(
     "V6 changes the scan order: it first builds a broad 1000+ stock universe and scans technical price history "
@@ -391,11 +391,12 @@ def technical_scan(symbols, batch_size=100, workers=4):
 
 
 def score_rows(out):
-    """Calculate a robust 0-100 technical swing score.
+    """Calculate a conservative 0-100 technical swing score.
 
-    Missing optional indicators (especially volume/RSI on some BSE names) do NOT
-    turn the whole score into NaN. Available components are re-weighted to 100%.
-    This keeps fundamentally-qualified stocks rankable while never inventing data.
+    Five components are scored: EMA trend, RSI, volume, 5D momentum and 20D
+    momentum. A score is only considered valid when at least 4/5 components
+    have real data; missing values are never invented and never produce a
+    misleading perfect score through aggressive re-weighting.
     """
     def clip_score(x, lo, hi):
         if pd.isna(x):
@@ -404,14 +405,32 @@ def score_rows(out):
 
     components = pd.DataFrame({
         "trend": out["EMA Distance %"].apply(lambda x: clip_score(x, 0, 20)),
-        "rsi": out["RSI 14"].apply(lambda x: 100 - abs(x - 55) * 2 if pd.notna(x) else np.nan).clip(lower=0, upper=100),
+        "rsi": out["RSI 14"].apply(
+            lambda x: 100 - abs(x - 55) * 2 if pd.notna(x) else np.nan
+        ).clip(lower=0, upper=100),
         "volume": out["Volume/20D"].apply(lambda x: clip_score(x, 0.7, 2.0)),
-        "momentum": out["5D %"].apply(lambda x: clip_score(x, -2, 8)),
+        "momentum5": out["5D %"].apply(lambda x: clip_score(x, -2, 8)),
+        "momentum20": out["20D %"].apply(lambda x: clip_score(x, -5, 20)),
     }, index=out.index)
-    weights = pd.Series({"trend": 0.35, "rsi": 0.25, "volume": 0.20, "momentum": 0.20})
+
+    # 30% trend, 20% RSI, 15% volume, 15% 5D momentum, 20% 20D momentum.
+    weights = pd.Series({
+        "trend": 0.30,
+        "rsi": 0.20,
+        "volume": 0.15,
+        "momentum5": 0.15,
+        "momentum20": 0.20,
+    })
+
+    coverage = components.notna().sum(axis=1)
     weighted = components.mul(weights, axis=1)
     available_weight = components.notna().mul(weights, axis=1).sum(axis=1)
-    score = weighted.sum(axis=1, min_count=1).div(available_weight.replace(0, np.nan)).mul(100 / 100)
+    score = weighted.sum(axis=1, min_count=1).div(
+        available_weight.replace(0, np.nan)
+    ).mul(100.0)
+
+    # Do not publish a ranking score with fewer than 4 of 5 real components.
+    score = score.where(coverage >= 4, np.nan)
     return score.round(1)
 
 
@@ -442,7 +461,7 @@ combined["Fundamental Pass"] = combined["NSE Symbol"].isin(fund_syms)
 st.write(f"**Technical universe sent to Yahoo: {len(combined)} stocks** (minimum broad universe {int(universe_size)} + any fundamental-qualified additions).")
 st.caption("This is the key V6 change: technical analysis is no longer limited to the 50 Screener-qualified names.")
 
-if st.button("🚀 RUN V6.2 — SCAN 1000+ STOCKS", type="primary", use_container_width=True):
+if st.button("🚀 RUN V6.3 — SCAN 1000+ STOCKS", type="primary", use_container_width=True):
     with st.spinner(f"Scanning {len(combined)} stocks for price, 200 EMA, RSI, volume and momentum..."):
         tech = technical_scan(combined["NSE Symbol"].tolist(), int(batch_size), int(max_workers))
 
@@ -458,7 +477,7 @@ if st.button("🚀 RUN V6.2 — SCAN 1000+ STOCKS", type="primary", use_containe
         out["Technical Pass"] &= out["Volume/20D"].ge(min_volume_ratio).fillna(False)
 
     out["Swing Score"] = score_rows(out)
-    out["Score Coverage"] = out[["EMA Distance %", "RSI 14", "Volume/20D", "5D %"]].notna().sum(axis=1)
+    out["Score Coverage"] = out[["EMA Distance %", "RSI 14", "Volume/20D", "5D %", "20D %"]].notna().sum(axis=1)
     out["Final Pass"] = out["Fundamental Pass"] & out["Technical Pass"]
 
     # Final ranking is only for stocks satisfying the exact fundamental filters.
