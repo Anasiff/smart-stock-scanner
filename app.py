@@ -11,7 +11,7 @@ from bs4 import BeautifulSoup
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Smart Stock Scanner V4.1", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Smart Stock Scanner V4.2", page_icon="📈", layout="wide")
 
 DEFAULT_SCREENER_URL = "https://www.screener.in/screens/3928301/cheetah/"
 DEFAULT_QUERY = (
@@ -20,11 +20,11 @@ DEFAULT_QUERY = (
     "Promoter holding > 50 AND Current price > DMA 200"
 )
 
-st.title("📈 Smart Stock Scanner V4.1")
+st.title("📈 Smart Stock Scanner V4.2")
 st.caption("Screener.in fundamentals + Yahoo Finance technicals • BTST / 2–4 day swing research")
 
 st.info(
-    "V4.1 fixes Screener symbol extraction; fundamentals remain sourced from Screener: fundamental hard filters are taken from a public "
+    "V4.2 adds NSE/BSE-aware Yahoo tickers; fundamentals remain sourced from Screener: fundamental hard filters are taken from a public "
     "Screener.in screen instead of reconstructing ROE/growth/debt from Yahoo. "
     "Yahoo is used only for price/200 EMA/RSI/volume checks. No stock is invented "
     "when a source is unavailable."
@@ -140,54 +140,108 @@ def load_uploaded_csv(uploaded):
 @st.cache_data(ttl=900, show_spinner=False)
 def technical_check(symbols):
     results = []
-    for sym in symbols:
-        ticker = sym if sym.endswith(".NS") else sym + ".NS"
-        try:
-            hist = yf.download(
-                ticker, period="1y", interval="1d",
-                auto_adjust=False, progress=False, threads=False
-            )
-            if hist is None or hist.empty:
-                results.append({"NSE Symbol": sym, "Price": np.nan, "200 EMA": np.nan, "Above 200 EMA": False,
-                                "RSI 14": np.nan, "Volume/20D": np.nan, "Technical Status": "No price data"})
-                continue
 
-            if isinstance(hist.columns, pd.MultiIndex):
-                hist.columns = hist.columns.get_level_values(0)
+    def candidates_for(raw):
+        s = str(raw).strip().upper()
+        if s.endswith(".NS") or s.endswith(".BO"):
+            return [s]
+        # BSE scrip codes are numeric; NSE equity symbols are normally alpha.
+        if s.isdigit():
+            return [s + ".BO"]
+        return [s + ".NS", s + ".BO"]
 
-            close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
-            volume = pd.to_numeric(hist.get("Volume", pd.Series(index=hist.index, dtype=float)), errors="coerce")
-            if len(close) < 210:
-                results.append({"NSE Symbol": sym, "Price": float(close.iloc[-1]) if len(close) else np.nan,
-                                "200 EMA": np.nan, "Above 200 EMA": False, "RSI 14": np.nan,
-                                "Volume/20D": np.nan, "Technical Status": "Insufficient history"})
-                continue
+    def calc_from_history(hist, sym, yahoo_symbol):
+        if hist is None or hist.empty:
+            return None
 
-            ema200 = close.ewm(span=200, adjust=False).mean()
-            delta = close.diff()
-            gain = delta.clip(lower=0).rolling(14).mean()
-            loss = (-delta.clip(upper=0)).rolling(14).mean()
-            rs = gain / loss.replace(0, np.nan)
-            rsi = 100 - (100 / (1 + rs))
-            vol_avg = volume.rolling(20).mean()
-            last_price = float(close.iloc[-1])
-            last_ema = float(ema200.iloc[-1])
-            last_rsi = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else np.nan
-            last_vr = float(volume.iloc[-1] / vol_avg.iloc[-1]) if pd.notna(vol_avg.iloc[-1]) and vol_avg.iloc[-1] else np.nan
+        if isinstance(hist.columns, pd.MultiIndex):
+            hist.columns = hist.columns.get_level_values(0)
 
-            results.append({
+        if "Close" not in hist.columns:
+            return None
+
+        close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+        volume = pd.to_numeric(
+            hist.get("Volume", pd.Series(index=hist.index, dtype=float)),
+            errors="coerce"
+        )
+        if len(close) < 210:
+            return {
                 "NSE Symbol": sym,
-                "Price": last_price,
-                "200 EMA": last_ema,
-                "Above 200 EMA": last_price > last_ema,
-                "RSI 14": last_rsi,
-                "Volume/20D": last_vr,
-                "Technical Status": "OK",
-            })
-        except Exception as e:
-            results.append({"NSE Symbol": sym, "Price": np.nan, "200 EMA": np.nan, "Above 200 EMA": False,
-                            "RSI 14": np.nan, "Volume/20D": np.nan, "Technical Status": f"Error: {type(e).__name__}"})
-        time.sleep(0.05)
+                "Yahoo Ticker": yahoo_symbol,
+                "Exchange": "BSE" if yahoo_symbol.endswith(".BO") else "NSE",
+                "Price": float(close.iloc[-1]) if len(close) else np.nan,
+                "200 EMA": np.nan,
+                "Above 200 EMA": False,
+                "RSI 14": np.nan,
+                "Volume/20D": np.nan,
+                "Technical Status": "Insufficient history",
+            }
+
+        ema200 = close.ewm(span=200, adjust=False).mean()
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / loss.replace(0, np.nan)
+        rsi = 100 - (100 / (1 + rs))
+        vol_avg = volume.rolling(20).mean()
+
+        last_price = float(close.iloc[-1])
+        last_ema = float(ema200.iloc[-1])
+        last_rsi = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else np.nan
+        last_vr = (
+            float(volume.iloc[-1] / vol_avg.iloc[-1])
+            if pd.notna(vol_avg.iloc[-1]) and vol_avg.iloc[-1]
+            else np.nan
+        )
+
+        return {
+            "NSE Symbol": sym,
+            "Yahoo Ticker": yahoo_symbol,
+            "Exchange": "BSE" if yahoo_symbol.endswith(".BO") else "NSE",
+            "Price": last_price,
+            "200 EMA": last_ema,
+            "Above 200 EMA": last_price > last_ema,
+            "RSI 14": last_rsi,
+            "Volume/20D": last_vr,
+            "Technical Status": "OK",
+        }
+
+    for sym in symbols:
+        found = None
+        attempted = []
+        for yahoo_symbol in candidates_for(sym):
+            attempted.append(yahoo_symbol)
+            try:
+                hist = yf.download(
+                    yahoo_symbol,
+                    period="1y",
+                    interval="1d",
+                    auto_adjust=False,
+                    progress=False,
+                    threads=False
+                )
+                found = calc_from_history(hist, sym, yahoo_symbol)
+                if found is not None and found["Technical Status"] in ("OK", "Insufficient history"):
+                    break
+            except Exception:
+                found = None
+            time.sleep(0.08)
+
+        if found is None:
+            found = {
+                "NSE Symbol": sym,
+                "Yahoo Ticker": attempted[-1] if attempted else "",
+                "Exchange": "BSE" if attempted and attempted[-1].endswith(".BO") else "NSE",
+                "Price": np.nan,
+                "200 EMA": np.nan,
+                "Above 200 EMA": False,
+                "RSI 14": np.nan,
+                "Volume/20D": np.nan,
+                "Technical Status": "No Yahoo price data",
+            }
+        results.append(found)
+
     return pd.DataFrame(results)
 
 st.subheader("1. Fundamental screen")
@@ -236,7 +290,7 @@ fund = fund.head(int(max_candidates)).copy()
 
 st.write(f"**Candidates sent to Yahoo technical check: {len(fund)}**")
 
-if st.button("🔎 RUN V4.1 SCAN", type="primary", use_container_width=True):
+if st.button("🔎 RUN V4.2 SCAN", type="primary", use_container_width=True):
     with st.spinner("Checking price, 200 EMA, RSI and volume for Screener-qualified stocks..."):
         tech = technical_check(fund["NSE Symbol"].tolist())
 
@@ -253,12 +307,13 @@ if st.button("🔎 RUN V4.1 SCAN", type="primary", use_container_width=True):
 
     out = out.sort_values(["Technical Pass", "Above 200 EMA", "RSI 14"], ascending=[False, False, False])
 
-    st.subheader("V4.1 Results")
+    st.subheader("V4.2 Results")
     passed = out[out["Technical Pass"]].copy()
     st.success(f"{len(passed)} stocks passed the Screener fundamentals + selected technical filters.")
 
     display_cols = [c for c in [
-        "Company", "NSE Symbol", "Price", "200 EMA", "Above 200 EMA",
+        "Company", "NSE Symbol", "Exchange", "Yahoo Ticker",
+        "Price", "200 EMA", "Above 200 EMA",
         "RSI 14", "Volume/20D", "Technical Pass"
     ] if c in out.columns]
     st.dataframe(out[display_cols], use_container_width=True, hide_index=True)
@@ -272,7 +327,7 @@ if st.button("🔎 RUN V4.1 SCAN", type="primary", use_container_width=True):
     )
 
     st.divider()
-    st.subheader("Why V4.1 is different")
+    st.subheader("Why V4.2 is different")
     st.write(
         "Fundamental qualification is delegated to the Screener screen instead of silently "
         "rejecting stocks because Yahoo returned missing ROE/growth/debt fields. Yahoo is only "
