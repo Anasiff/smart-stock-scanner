@@ -1,35 +1,41 @@
-# Smart Stock Scanner V6
+# Smart Stock Scanner V4
 
-Free Streamlit scanner for Indian NSE/BSE BTST and 2–4 day swing research.
+V4 deliberately changes the data architecture.
 
-## What changed in V6
-- **Broad technical universe:** default minimum 1000 stocks, configurable up to 5000.
-- The app loads a public Screener **all-companies** screen and scans a broad universe first.
-- All stocks from the exact 7-filter fundamental screen are added to the technical universe even if they are outside the first N broad stocks.
-- Technical history is downloaded in **Yahoo Finance batches** rather than one request per stock.
-- NSE symbols use `.NS`; numeric/BSE symbols use `.BO`; missing NSE data gets a `.BO` fallback.
-- 200 EMA, RSI(14), volume/20D, 5D and 20D momentum are calculated locally.
-- The exact fundamental hard filters remain delegated to Screener:
-  - P/E < 30
-  - ROE > 25%
-  - EPS > 0
-  - Profit growth > 50%
-  - Sales growth > 50%
-  - Debt/Equity < 0.5
-  - Promoter holding > 50%
-- Screener's DMA-200 condition is intentionally not used; V6 calculates 200 EMA locally.
-- Missing technical data is reported and never treated as a pass.
-- Final ranking uses the existing Swing Score only after the fundamental + technical intersection.
+## Fundamental source
+The default public Screener.in screen contains the original hard filters:
 
-## Default sources
-Broad universe:
-`https://www.screener.in/screens/509570/all-companies/?order=desc`
+Price to Earning < 30
+Return on equity > 25
+EPS > 0
+Profit growth > 50
+Sales growth > 50
+Debt to equity < 0.5
+Promoter holding > 50
+Current price > DMA 200
 
-Fundamental screen:
-`https://www.screener.in/screens/3635525/1/`
+V4 reads the public result table instead of reconstructing these fields from Yahoo Finance.
 
-## Important limitation
-Screener officially says it does not provide a public developer API. V6 therefore reads public screen HTML pages. Yahoo Finance is used for price history/technical calculations and may be incomplete or rate-limited for some BSE/newly listed securities.
+## Technical source
+Yahoo Finance is used only for:
+- Price
+- 200 EMA
+- RSI 14
+- Volume / 20-day average
 
-## Deployment
-Replace `app.py` in the existing GitHub repo and keep the existing `requirements.txt`.
+## Important
+Screener.in does not provide a public API. V4 therefore reads a public screen's HTML. If the public page is blocked or its layout changes, upload a Screener CSV instead.
+
+No fake/demo stocks are generated and missing data is never silently converted into a passing fundamental value.
+
+
+## V4.1 fix
+Screener company/NSE symbols are extracted from `/company/<symbol>/` links generically. The app refuses to run if symbols cannot be extracted, rather than producing 0 Yahoo candidates.
+
+
+## V4.2 fix
+- Numeric Indian scrip codes are treated as BSE and queried with `.BO`.
+- Normal NSE symbols are queried with `.NS`.
+- If an alphanumeric NSE symbol has no Yahoo history, V4.2 automatically tries `.BO`.
+- Results show the exchange and actual Yahoo ticker used.
+- Fundamental qualification still comes from the Screener screen; Yahoo is technical-only.
