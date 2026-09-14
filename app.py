@@ -2,6 +2,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -10,7 +11,7 @@ from bs4 import BeautifulSoup
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Smart Stock Scanner V6", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Smart Stock Scanner V7", page_icon="📈", layout="wide")
 
 DEFAULT_FUNDAMENTAL_URL = "https://www.screener.in/screens/3635525/1/"
 DEFAULT_UNIVERSE_URL = "https://www.screener.in/screens/509570/all-companies/?order=desc"
@@ -20,13 +21,13 @@ DEFAULT_QUERY = (
     "Promoter holding > 50"
 )
 
-st.title("📈 Smart Stock Scanner V6.2")
-st.caption("1000+ stock technical scan • exact 7 fundamental filters • robust 5-factor Swing Score • BTST / 2–4 day swing research")
+st.title("📈 Smart Stock Scanner V7")
+st.caption("1000+ stock technical scan • exact 7 fundamental filters • 5-factor Swing Score • historical probability forecast • BTST / 2–5 day swing research")
 
 st.info(
-    "V6 changes the scan order: it first builds a broad 1000+ stock universe and scans technical price history "
-    "in bulk, then intersects those results with the exact 7 fundamental filters from Screener. This avoids "
-    "the old 50-stock technical bottleneck. No fundamental values are invented."
+    "V7 keeps the V6 architecture and adds a historical-analog probability layer. It does NOT predict a guaranteed "
+    "future price: it estimates how often similar past setups reached +5/+10/+15/+20/+30/+40% within 5 or 10 trading days, "
+    "and how often they hit -5% downside. Probabilities are historical estimates, not promises."
 )
 
 with st.sidebar:
@@ -55,6 +56,16 @@ with st.sidebar:
     min_volume_ratio = st.number_input("Min volume / 20D avg (optional)", 0.0, 20.0, 0.0, 0.1)
     max_workers = st.number_input("Technical download workers", 1, 8, 4, 1)
     batch_size = st.number_input("Yahoo batch size", 25, 200, 100, 25)
+
+    st.divider()
+    st.header("Historical probability forecast")
+    enable_forecast = st.checkbox("Enable 5D/10D probability forecast", value=True)
+    forecast_max_stocks = st.number_input(
+        "Maximum stocks to forecast", 10, 300, 100, 10,
+        help="Forecasting is the expensive step. Priority: Final Pass, then Fundamental Pass, then Technical Pass/score."
+    )
+    forecast_years = st.number_input("Historical lookback (years)", 2, 5, 3, 1)
+    analog_count = st.number_input("Historical analogs per stock", 20, 100, 60, 10)
 
     st.divider()
     st.header("Diagnostics")
@@ -434,6 +445,192 @@ def score_rows(out):
     return score.round(1)
 
 
+
+
+def _normalize_single_history(hist, ticker):
+    """Normalize a Yahoo single-ticker DataFrame to OHLCV Series."""
+    if hist is None or hist.empty:
+        return None
+    h = hist.copy()
+    if isinstance(h.columns, pd.MultiIndex):
+        try:
+            h = h.xs(ticker, axis=1, level=-1, drop_level=True)
+        except Exception:
+            h.columns = h.columns.get_level_values(0)
+    if "Close" not in h.columns:
+        return None
+    close = pd.to_numeric(h["Close"], errors="coerce")
+    high = pd.to_numeric(h.get("High", close), errors="coerce")
+    low = pd.to_numeric(h.get("Low", close), errors="coerce")
+    volume = pd.to_numeric(h.get("Volume", pd.Series(index=h.index, dtype=float)), errors="coerce")
+    frame = pd.DataFrame({"Close": close, "High": high, "Low": low, "Volume": volume}).dropna(subset=["Close"])
+    return frame
+
+
+def _historical_feature_frame(frame):
+    close = frame["Close"]
+    volume = frame["Volume"]
+    high = frame["High"]
+    low = frame["Low"]
+    ema200 = close.ewm(span=200, adjust=False).mean()
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+    rsi = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
+    vol_avg = volume.rolling(20).mean()
+    dist = (close / ema200 - 1) * 100
+    ret5 = close.pct_change(5) * 100
+    ret20 = close.pct_change(20) * 100
+    return pd.DataFrame({
+        "dist": dist, "rsi": rsi, "volratio": volume / vol_avg,
+        "ret5": ret5, "ret20": ret20,
+    }, index=frame.index)
+
+
+def _forecast_one(hist, ticker, current_row, analog_k=60):
+    """Historical nearest-setup analog forecast; strictly no look-ahead."""
+    frame = _normalize_single_history(hist, ticker)
+    if frame is None or len(frame) < 280:
+        return {"Forecast Status": "Insufficient forecast history", "Forecast Samples": 0}
+    feats = _historical_feature_frame(frame)
+    # Do not use the last 10 completed sessions as analogs because their forward window is incomplete.
+    usable_end = len(frame) - 11
+    if usable_end <= 30:
+        return {"Forecast Status": "Insufficient forecast history", "Forecast Samples": 0}
+
+    current = pd.Series({
+        "dist": current_row.get("EMA Distance %", np.nan),
+        "rsi": current_row.get("RSI 14", np.nan),
+        "volratio": current_row.get("Volume/20D", np.nan),
+        "ret5": current_row.get("5D %", np.nan),
+        "ret20": current_row.get("20D %", np.nan),
+    }, dtype=float)
+    scales = pd.Series({"dist": 20.0, "rsi": 10.0, "volratio": 0.75, "ret5": 5.0, "ret20": 10.0})
+    valid_current = current.notna()
+    if valid_current.sum() < 4:
+        return {"Forecast Status": "Insufficient current setup data", "Forecast Samples": 0}
+
+    candidates = feats.iloc[:usable_end].copy()
+    candidates = candidates.loc[candidates.notna().sum(axis=1) >= 4]
+    if candidates.empty:
+        return {"Forecast Status": "No historical analogs", "Forecast Samples": 0}
+
+    d = pd.DataFrame(index=candidates.index)
+    for col in current.index:
+        if pd.notna(current[col]):
+            d[col] = (candidates[col] - current[col]).abs() / scales[col]
+    d["distance"] = d.mean(axis=1, skipna=True)
+    nearest = d.sort_values("distance").head(int(analog_k)).index
+
+    rows = []
+    for idx in nearest:
+        pos = frame.index.get_loc(idx)
+        base = float(frame["Close"].iloc[pos])
+        if base <= 0:
+            continue
+        rec = {"max5": np.nan, "max10": np.nan, "min5": np.nan, "min10": np.nan}
+        for h in (5, 10):
+            end = min(pos + h + 1, len(frame))
+            if end <= pos + 1:
+                continue
+            highs = frame["High"].iloc[pos+1:end].dropna()
+            lows = frame["Low"].iloc[pos+1:end].dropna()
+            if not highs.empty:
+                rec[f"max{h}"] = float(highs.max() / base - 1) * 100
+            if not lows.empty:
+                rec[f"min{h}"] = float(lows.min() / base - 1) * 100
+        rows.append(rec)
+    if len(rows) < 20:
+        return {"Forecast Status": "Too few analogs", "Forecast Samples": len(rows)}
+
+    a = pd.DataFrame(rows)
+    result = {"Forecast Status": "OK", "Forecast Samples": int(len(a))}
+    for h in (5, 10):
+        maxs = a[f"max{h}"].dropna()
+        mins = a[f"min{h}"].dropna()
+        for target in (5, 10, 15, 20, 30, 40):
+            result[f"P +{target}% ({h}D)"] = float((maxs >= target).mean() * 100) if len(maxs) else np.nan
+        result[f"P -5% ({h}D)"] = float((mins <= -5).mean() * 100) if len(mins) else np.nan
+        result[f"Median Max Move ({h}D)"] = float(maxs.median()) if len(maxs) else np.nan
+        result[f"Q25 Max Move ({h}D)"] = float(maxs.quantile(0.25)) if len(maxs) else np.nan
+        result[f"Q75 Max Move ({h}D)"] = float(maxs.quantile(0.75)) if len(maxs) else np.nan
+        result[f"Median Min Move ({h}D)"] = float(mins.median()) if len(mins) else np.nan
+    # A compact historical conviction measure: upside chance minus downside chance,
+    # anchored to +5% in 5D. It is NOT a probability and is deliberately labeled as a score.
+    p_up = result.get("P +5% (5D)", np.nan)
+    p_down = result.get("P -5% (5D)", np.nan)
+    result["Historical Edge Score"] = round(max(0.0, min(100.0, (p_up - p_down + 100) / 2)) if pd.notna(p_up) and pd.notna(p_down) else np.nan, 1)
+    if len(a) >= 50:
+        result["Forecast Confidence"] = "High"
+    elif len(a) >= 30:
+        result["Forecast Confidence"] = "Medium"
+    else:
+        result["Forecast Confidence"] = "Low"
+    return result
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def forecast_download(tickers, years=3, batch_size=50, workers=2):
+    """Download multi-year daily history for a limited forecast candidate set."""
+    tickers = list(dict.fromkeys(tickers))
+    out = {}
+    chunks = [tickers[i:i+batch_size] for i in range(0, len(tickers), batch_size)]
+    def one(chunk):
+        try:
+            data = yf.download(
+                tickers=chunk, period=f"{int(years)}y", interval="1d", auto_adjust=False,
+                progress=False, threads=False, group_by="column"
+            )
+            return chunk, data
+        except Exception:
+            return chunk, None
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(one, c) for c in chunks]
+        for fut in as_completed(futures):
+            chunk, data = fut.result()
+            if data is None or data.empty:
+                continue
+            if isinstance(data.columns, pd.MultiIndex):
+                for ticker in chunk:
+                    try:
+                        sub = data.xs(ticker, axis=1, level=1, drop_level=True)
+                    except Exception:
+                        try:
+                            sub = data[ticker]
+                        except Exception:
+                            continue
+                    out[ticker] = sub
+            elif len(chunk) == 1:
+                out[chunk[0]] = data
+    return out
+
+
+def run_historical_forecast(out, max_stocks, years, analog_k, batch_size, workers):
+    """Forecast priority: Final Pass -> Fundamental Pass -> Technical Pass -> Swing Score."""
+    work = out.copy()
+    work["_priority"] = (
+        work["Final Pass"].astype(int) * 1000000
+        + work["Fundamental Pass"].astype(int) * 10000
+        + work["Technical Pass"].astype(int) * 100
+        + work["Swing Score"].fillna(-1)
+    )
+    selected = work.sort_values("_priority", ascending=False).head(int(max_stocks))
+    tickers = selected["Yahoo Ticker"].dropna().astype(str).tolist()
+    hist_map = forecast_download(tickers, years=int(years), batch_size=min(50, int(batch_size)), workers=int(workers))
+    records = {}
+    for _, row in selected.iterrows():
+        ticker = str(row.get("Yahoo Ticker", ""))
+        if ticker in hist_map:
+            records[row["NSE Symbol"]] = _forecast_one(hist_map[ticker], ticker, row, analog_k=int(analog_k))
+        else:
+            records[row["NSE Symbol"]] = {"Forecast Status": "No forecast history", "Forecast Samples": 0}
+    cols = sorted({k for v in records.values() for k in v.keys()})
+    fdf = pd.DataFrame.from_dict(records, orient="index") if records else pd.DataFrame()
+    if not fdf.empty:
+        fdf.index.name = "NSE Symbol"
+        fdf = fdf.reset_index()
+    return fdf
+
 # --------------------------- LOAD SOURCES ---------------------------
 st.subheader("1. Build broad universe")
 try:
@@ -480,6 +677,20 @@ if st.button("🚀 RUN V6.3 — SCAN 1000+ STOCKS", type="primary", use_containe
     out["Score Coverage"] = out[["EMA Distance %", "RSI 14", "Volume/20D", "5D %", "20D %"]].notna().sum(axis=1)
     out["Final Pass"] = out["Fundamental Pass"] & out["Technical Pass"]
 
+    if enable_forecast:
+        with st.spinner(f"Building historical 5D/10D probability forecasts for up to {int(forecast_max_stocks)} priority stocks..."):
+            forecast_df = run_historical_forecast(
+                out, int(forecast_max_stocks), int(forecast_years), int(analog_count), int(batch_size), int(max_workers)
+            )
+        if not forecast_df.empty:
+            out = out.merge(forecast_df, on="NSE Symbol", how="left")
+        else:
+            out["Forecast Status"] = "Unavailable"
+            out["Forecast Samples"] = 0
+    else:
+        out["Forecast Status"] = "Disabled"
+        out["Forecast Samples"] = 0
+
     # Final ranking is only for stocks satisfying the exact fundamental filters.
     out = out.sort_values(
         ["Final Pass", "Fundamental Pass", "Technical Pass", "Swing Score", "5D %"],
@@ -498,7 +709,7 @@ if st.button("🚀 RUN V6.3 — SCAN 1000+ STOCKS", type="primary", use_containe
     c3.metric("Fundamental pass", fund_count)
     c4.metric("Final pass", final_count)
 
-    st.subheader("V6.2 Final Ranked Results")
+    st.subheader("V7 Final Ranked Results")
     st.success(f"{final_count} stocks passed all 7 fundamental filters + selected technical filters.")
     if missing:
         st.warning(f"{missing} stocks had insufficient/missing Yahoo price history. They are NOT treated as passes.")
@@ -506,27 +717,31 @@ if st.button("🚀 RUN V6.3 — SCAN 1000+ STOCKS", type="primary", use_containe
     display_cols = [c for c in [
         "Company", "NSE Symbol", "Exchange", "Yahoo Ticker", "Fundamental Pass",
         "Price", "Historical Close", "200 EMA", "EMA Distance %", "Above 200 EMA", "RSI 14",
-        "Volume/20D", "5D %", "20D %", "Swing Score", "Score Coverage", "Technical Status",
-        "Technical Pass", "Final Pass"
+        "Volume/20D", "5D %", "20D %", "Swing Score", "Score Coverage",
+        "Forecast Status", "Forecast Samples", "Forecast Confidence", "Historical Edge Score",
+        "P +5% (5D)", "P +10% (5D)", "P +20% (5D)", "P +40% (5D)", "P -5% (5D)",
+        "Median Max Move (5D)", "P +5% (10D)", "P +10% (10D)", "P +20% (10D)", "P +40% (10D)", "P -5% (10D)",
+        "Median Max Move (10D)", "Technical Status", "Technical Pass", "Final Pass"
     ] if c in out.columns]
 
     st.dataframe(out[display_cols], use_container_width=True, hide_index=True)
     st.download_button(
-        "⬇️ Download V6.2 full scan CSV",
+        "⬇️ Download V7 full scan CSV",
         out.to_csv(index=False).encode(),
-        "smart_stock_scanner_v6_2_full_scan.csv",
+        "smart_stock_scanner_v7_full_scan.csv",
         "text/csv",
         use_container_width=True,
     )
 
     st.divider()
-    st.subheader("How V6 works")
+    st.subheader("How V7 works")
     st.write(
         "1) Scan a broad 1000+ listed-stock universe for technical history. "
         "2) Add all stocks from the exact 7-filter Screener result so none of the fundamental-qualified names are lost. "
-        "3) Calculate 200 EMA, RSI(14), volume/20D and momentum locally. "
-        "4) Apply technical filters. "
-        "5) Keep only the intersection of the exact fundamental screen and technical pass, then rank by Swing Score."
+        "3) Calculate 20/50/200 EMA, Wilder RSI(14), ATR(14), volume/20D and 5D/20D momentum locally. "
+        "4) Apply technical filters and keep the exact fundamental ∩ technical intersection. "
+        "5) Rank with the existing 0–100 Swing Score. "
+        "6) For priority candidates, find nearest historical setups from up to 5 years of daily data and estimate the empirical chance of reaching +5/+10/+15/+20/+30/+40% within 5/10 trading days, plus -5% downside probability. No future values are used to build historical features."
     )
 
 st.caption(
