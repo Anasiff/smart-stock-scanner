@@ -339,7 +339,7 @@ def technical_scan(symbols, batch_size=100, workers=4):
         ticker_to_symbol[t] = sym
         primary[sym] = t
 
-    first_tickers = list(ticker_to_symbol.keys())
+    first_tickers = list(primary.values())
     # Download in batches.
     hist_map = batch_download(first_tickers, batch_size, workers)
     intraday_map = latest_intraday_prices(first_tickers, max(25, min(int(batch_size), 75)), workers)
@@ -427,7 +427,7 @@ def score_rows(out):
     available_weight = components.notna().mul(weights, axis=1).sum(axis=1)
     score = weighted.sum(axis=1, min_count=1).div(
         available_weight.replace(0, np.nan)
-    )
+    ).mul(100.0)
 
     # Do not publish a ranking score with fewer than 4 of 5 real components.
     score = score.where(coverage >= 4, np.nan)
@@ -461,7 +461,7 @@ combined["Fundamental Pass"] = combined["NSE Symbol"].isin(fund_syms)
 st.write(f"**Technical universe sent to Yahoo: {len(combined)} stocks** (minimum broad universe {int(universe_size)} + any fundamental-qualified additions).")
 st.caption("This is the key V6 change: technical analysis is no longer limited to the 50 Screener-qualified names.")
 
-if st.button("🚀 RUN V6.4 — SCAN 1000+ STOCKS", type="primary", use_container_width=True):
+if st.button("🚀 RUN V6.3 — SCAN 1000+ STOCKS", type="primary", use_container_width=True):
     with st.spinner(f"Scanning {len(combined)} stocks for price, 200 EMA, RSI, volume and momentum..."):
         tech = technical_scan(combined["NSE Symbol"].tolist(), int(batch_size), int(max_workers))
 
