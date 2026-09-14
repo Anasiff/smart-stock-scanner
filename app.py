@@ -11,7 +11,7 @@ from bs4 import BeautifulSoup
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Smart Stock Scanner V7.1", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Smart Stock Scanner V8", page_icon="📈", layout="wide")
 
 DEFAULT_FUNDAMENTAL_URL = "https://www.screener.in/screens/3635525/1/"
 DEFAULT_UNIVERSE_URL = "https://www.screener.in/screens/509570/all-companies/?order=desc"
@@ -21,13 +21,29 @@ DEFAULT_QUERY = (
     "Promoter holding > 50"
 )
 
-st.title("📈 Smart Stock Scanner V7.1")
-st.caption("1000+ stock technical scan • exact 7 fundamental filters • 5-factor Swing Score • historical probability forecast • 5D expected upside/downside • Swing Conviction • BTST / 2–5 day swing research")
+# ---- V8 forecast engine constants ----
+LOOKAHEAD_DAYS = 5                 # forecast horizon (trading days)
+MIN_TECH_BARS = 210                # bars required for a reliable 200 EMA
+MIN_ANALOG_CANDIDATE_ROWS = 60     # minimum valid historical feature rows before we even try
+MIN_VALID_ANALOGS = 10             # below this -> NO FORECAST (never fabricate a forecast from <10 samples)
+FEATURE_COLS = [
+    "dist20", "dist50", "dist200", "slope20", "slope50", "slope200",
+    "rsi", "rsi_slope", "atr_pct", "ret5", "ret10", "ret20",
+    "volratio", "pos20", "pos60", "vola20", "dist_high20", "dist_low20",
+]
+
+st.title("📈 Smart Stock Scanner V8 — Historical Analog Forecast Engine")
+st.caption(
+    "Complete NSE universe scan • exact 7 fundamental filters • full technical indicator suite • "
+    "walk-forward, no-look-ahead 3–5 day historical analog forecast • Swing Conviction • Swing Call"
+)
 
 st.info(
-    "V7 keeps the V6 architecture and adds a historical-analog probability layer. It does NOT predict a guaranteed "
-    "future price: it estimates how often similar past setups reached +5/+10/+15/+20/+30/+40% within 5 or 10 trading days, "
-    "and how often they hit -5% downside. Probabilities are historical estimates, not promises."
+    "V8 replaces the old weighted Swing Score with a historical-analog / walk-forward forecast engine. "
+    "For every stock with enough history, today's technical setup is compared against its own past setups "
+    "(no future data is ever used to build a historical snapshot), and the engine reports how often similar "
+    "past setups actually went on to gain or lose over the next 5 trading days. This is a historical-pattern "
+    "estimate, not a guaranteed prediction."
 )
 
 with st.sidebar:
@@ -36,9 +52,9 @@ with st.sidebar:
         "Minimum broad stocks to scan",
         min_value=100,
         max_value=5000,
-        value=1000,
+        value=2000,
         step=100,
-        help="V6 scans at least this many broad listed companies for technical data. Fundamental-qualified stocks are added too."
+        help="V8 scans at least this many broad listed companies. Fundamental-qualified stocks are added too, and pagination continues until the source is exhausted or this minimum is met."
     )
     universe_url = st.text_input("Public Screener all-companies URL", value=DEFAULT_UNIVERSE_URL)
     st.caption("Default is a public all-listed-companies screen sorted by market cap descending.")
@@ -46,30 +62,33 @@ with st.sidebar:
 
     st.header("Fundamental source")
     fund_url = st.text_input("Public Screener fundamental screen URL", value=DEFAULT_FUNDAMENTAL_URL)
-    st.caption("Default screen contains the exact 7 hard filters. 200 EMA is NOT part of this source filter.")
+    st.caption("Default screen contains the exact 7 hard filters. This is used for the Fundamental Pass column only — it never removes a stock from the technical/forecast scan.")
     st.divider()
 
-    st.header("Technical filters")
-    require_above_200 = st.checkbox("Price > 200 EMA", value=True)
+    st.header("Technical filters (optional, display only)")
+    require_above_200 = st.checkbox("Price > 200 EMA (used for Technical Pass)", value=True)
     min_rsi = st.number_input("Minimum RSI (optional)", 0.0, 100.0, 0.0, 1.0)
     max_rsi = st.number_input("Maximum RSI (optional)", 0.0, 100.0, 100.0, 1.0)
     min_volume_ratio = st.number_input("Min volume / 20D avg (optional)", 0.0, 20.0, 0.0, 0.1)
-    max_workers = st.number_input("Technical download workers", 1, 8, 4, 1)
+    max_workers = st.number_input("Download workers", 1, 8, 4, 1, help="Capped at 4 internally regardless of this value, to avoid hammering Yahoo.")
     batch_size = st.number_input("Yahoo batch size", 25, 200, 100, 25)
 
     st.divider()
-    st.header("Historical probability forecast")
-    enable_forecast = st.checkbox("Enable 5D/10D probability forecast", value=True)
-    forecast_max_stocks = st.number_input(
-        "Maximum stocks to forecast", 10, 300, 100, 10,
-        help="Forecasting is the expensive step. Priority: Final Pass, then Fundamental Pass, then Technical Pass/score."
-    )
+    st.header("Historical analog forecast")
     forecast_years = st.number_input("Historical lookback (years)", 2, 5, 3, 1)
-    analog_count = st.number_input("Historical analogs per stock", 20, 100, 60, 10)
+    analog_count = st.number_input("Historical analogs (K)", 30, 100, 60, 10)
+    forecast_limit = st.number_input(
+        "Limit forecast to top-N stocks (0 = forecast entire universe)",
+        min_value=0, max_value=5000, value=0, step=100,
+        help="Default 0 forecasts every stock with sufficient history, as required. Set a limit only if you need a faster scan; limited stocks are still shown in the table, just without a forecast."
+    )
+    min_turnover = st.number_input(
+        "Minimum 20D avg turnover (₹) for VERY STRONG liquidity gate", 0, 100000000, 5000000, 500000
+    )
 
     st.divider()
     st.header("Diagnostics")
-    st.caption("Price uses the latest same-day 15-minute Yahoo bar when available; 200 EMA remains based on daily history. Yahoo may still be delayed.")
+    st.caption("Price uses the latest same-day 15-minute Yahoo bar when available; all EMAs/RSI/ATR remain based on daily history. Yahoo may still be delayed.")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -77,6 +96,10 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+
+# =====================================================================
+# 1. UNIVERSE / FUNDAMENTAL SOURCE LOADING (unchanged architecture)
+# =====================================================================
 
 def set_page(url, page_no):
     p = urlparse(url)
@@ -166,8 +189,9 @@ def fetch_public_screen(url, max_pages=20, stop_after=None):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_universe(url, minimum):
+    # Continue pagination until the source is exhausted or the minimum is met — never stop artificially at 1000.
     pages = int(np.ceil(minimum / 25)) + 2
-    return fetch_public_screen(url, max_pages=min(220, pages), stop_after=int(minimum))
+    return fetch_public_screen(url, max_pages=min(400, pages), stop_after=int(minimum))
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -184,85 +208,54 @@ def yahoo_candidates(symbol):
     return [s + ".NS", s + ".BO"]
 
 
-def normalize_yahoo_frame(hist, ticker):
-    if hist is None or hist.empty:
-        return None
-    h = hist.copy()
-    if isinstance(h.columns, pd.MultiIndex):
-        # Single ticker download may still have a multi-index.
-        if ticker in h.columns.get_level_values(-1):
+# =====================================================================
+# 2. BATCH DOWNLOAD (single long-history pull feeds BOTH technicals and
+#    the forecast engine — no per-stock / per-analog web requests)
+# =====================================================================
+
+def _split_multiindex(data, chunk):
+    out = {}
+    if isinstance(data.columns, pd.MultiIndex):
+        for ticker in chunk:
             try:
-                h = h.xs(ticker, axis=1, level=-1)
+                sub = data.xs(ticker, axis=1, level=1, drop_level=True)
             except Exception:
-                h.columns = h.columns.get_level_values(0)
-        else:
-            h.columns = h.columns.get_level_values(0)
-    if "Close" not in h.columns:
-        return None
-    close = pd.to_numeric(h["Close"], errors="coerce").dropna()
-    if close.empty:
-        return None
-    volume = pd.to_numeric(h.get("Volume", pd.Series(index=h.index, dtype=float)), errors="coerce")
-    return close, volume
+                try:
+                    sub = data[ticker]
+                except Exception:
+                    continue
+            out[ticker] = sub
+    elif len(chunk) == 1:
+        out[chunk[0]] = data
+    return out
 
 
-def calc_technical(sym, ticker, hist, current_price=np.nan):
-    norm = normalize_yahoo_frame(hist, ticker)
-    if norm is None:
-        return None
-    close, volume = norm
-    historical_close = float(close.iloc[-1])
-    last_price = float(current_price) if pd.notna(current_price) and float(current_price) > 0 else historical_close
-    if len(close) < 210:
-        return {
-            "NSE Symbol": sym, "Yahoo Ticker": ticker,
-            "Exchange": "BSE" if ticker.endswith(".BO") else "NSE",
-            "Price": last_price, "Historical Close": historical_close, "200 EMA": np.nan, "EMA Distance %": np.nan,
-            "Above 200 EMA": False, "RSI 14": np.nan, "Volume/20D": np.nan,
-            "5D %": np.nan, "20D %": np.nan, "Technical Status": "Insufficient history",
-        }
-
-    ema200 = close.ewm(span=200, adjust=False).mean()
-    delta = close.diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    vol_avg = volume.rolling(20).mean()
-    last_ema = float(ema200.iloc[-1])
-    last_rsi = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else np.nan
-    vr = float(volume.iloc[-1] / vol_avg.iloc[-1]) if pd.notna(vol_avg.iloc[-1]) and vol_avg.iloc[-1] else np.nan
-    ret5 = float((close.iloc[-1] / close.iloc[-6] - 1) * 100) if len(close) >= 6 else np.nan
-    ret20 = float((close.iloc[-1] / close.iloc[-21] - 1) * 100) if len(close) >= 21 else np.nan
-    dist = float((last_price / last_ema - 1) * 100) if last_ema else np.nan
-    return {
-        "NSE Symbol": sym, "Yahoo Ticker": ticker,
-        "Exchange": "BSE" if ticker.endswith(".BO") else "NSE",
-        "Price": last_price, "Historical Close": historical_close, "200 EMA": last_ema, "EMA Distance %": dist,
-        "Above 200 EMA": bool(last_price > last_ema), "RSI 14": last_rsi,
-        "Volume/20D": vr, "5D %": ret5, "20D %": ret20, "Technical Status": "OK",
-    }
-
-
-def batch_download(tickers, batch_size, workers):
-    """Download many Yahoo tickers in parallel batches. Returns {ticker: history_frame}."""
+@st.cache_data(ttl=1800, show_spinner=False)
+def download_history_batch(tickers, period_years, batch_size, workers):
+    """Download `period_years` of daily history for many tickers in small batches.
+    2-4 workers max, retries with exponential backoff, graceful failure per chunk.
+    This single download is reused for both current technical indicators and the
+    full historical-analog forecast, so analogs never require their own web request.
+    """
+    tickers = list(dict.fromkeys(tickers))
+    workers = max(1, min(int(workers), 4))
     chunks = [tickers[i:i + batch_size] for i in range(0, len(tickers), batch_size)]
-    output = {}
+    out = {}
 
     def one(chunk):
-        try:
-            data = yf.download(
-                tickers=chunk,
-                period="1y",
-                interval="1d",
-                auto_adjust=False,
-                progress=False,
-                threads=True,
-                group_by="column",
-            )
-            return chunk, data
-        except Exception:
-            return chunk, None
+        last_err = None
+        for attempt in range(3):
+            try:
+                data = yf.download(
+                    tickers=chunk, period=f"{int(period_years)}y", interval="1d",
+                    auto_adjust=False, progress=False, threads=False, group_by="column",
+                )
+                if data is not None and not data.empty:
+                    return chunk, data
+            except Exception as e:
+                last_err = e
+            time.sleep((2 ** attempt) * 0.75)
+        return chunk, None
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = [ex.submit(one, c) for c in chunks]
@@ -270,32 +263,16 @@ def batch_download(tickers, batch_size, workers):
             chunk, data = fut.result()
             if data is None or data.empty:
                 continue
-            if isinstance(data.columns, pd.MultiIndex):
-                level0 = set(data.columns.get_level_values(0))
-                # yfinance normally returns PriceField x Ticker for multi-symbol downloads.
-                for ticker in chunk:
-                    try:
-                        sub = data.xs(ticker, axis=1, level=1, drop_level=True)
-                    except Exception:
-                        try:
-                            sub = data[ticker]
-                        except Exception:
-                            continue
-                    output[ticker] = sub
-            else:
-                # Single-ticker fallback.
-                output[chunk[0]] = data
-    return output
+            out.update(_split_multiindex(data, chunk))
+    return out
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def latest_intraday_prices(tickers, batch_size=50, workers=4):
-    """Get same-day/latest intraday price for display and EMA-distance calculations.
-    Falls back to daily history when Yahoo has no intraday data.
-    Yahoo quotes can still be delayed; this avoids using an old daily close when a newer
-    same-day bar is available.
-    """
+    """Latest same-day intraday price + timestamp. Falls back silently to daily close
+    (handled by the caller) when Yahoo has no intraday bars."""
     tickers = list(dict.fromkeys(tickers))
+    workers = max(1, min(int(workers), 4))
     out = {}
     chunks = [tickers[i:i + batch_size] for i in range(0, len(tickers), batch_size)]
 
@@ -303,7 +280,7 @@ def latest_intraday_prices(tickers, batch_size=50, workers=4):
         try:
             data = yf.download(
                 tickers=chunk, period="5d", interval="15m", auto_adjust=False,
-                progress=False, threads=True, group_by="column", prepost=False
+                progress=False, threads=False, group_by="column", prepost=False
             )
             return chunk, data
         except Exception:
@@ -315,140 +292,21 @@ def latest_intraday_prices(tickers, batch_size=50, workers=4):
             chunk, data = fut.result()
             if data is None or data.empty:
                 continue
-            if isinstance(data.columns, pd.MultiIndex):
-                for ticker in chunk:
-                    try:
-                        sub = data.xs(ticker, axis=1, level=1, drop_level=True)
-                    except Exception:
-                        try:
-                            sub = data[ticker]
-                        except Exception:
-                            continue
-                    if "Close" in sub.columns:
-                        c = pd.to_numeric(sub["Close"], errors="coerce").dropna()
-                        if not c.empty:
-                            out[ticker] = float(c.iloc[-1])
-            else:
-                if len(chunk) == 1 and "Close" in data.columns:
-                    c = pd.to_numeric(data["Close"], errors="coerce").dropna()
+            split = _split_multiindex(data, chunk)
+            for ticker, sub in split.items():
+                if "Close" in sub.columns:
+                    c = pd.to_numeric(sub["Close"], errors="coerce").dropna()
                     if not c.empty:
-                        out[chunk[0]] = float(c.iloc[-1])
+                        out[ticker] = (float(c.iloc[-1]), c.index[-1])
     return out
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def technical_scan(symbols, batch_size=100, workers=4):
-    symbols = [str(x).strip().upper() for x in symbols]
-    primary = {}
-    fallback_needed = []
-    ticker_to_symbol = {}
+# =====================================================================
+# 3. FEATURE ENGINEERING (technical indicators, computed once per stock
+#    from the same downloaded frame, no look-ahead)
+# =====================================================================
 
-    # First pass: NSE alpha symbols use .NS; BSE numeric symbols use .BO.
-    for sym in symbols:
-        candidates = yahoo_candidates(sym)
-        t = candidates[0]
-        ticker_to_symbol[t] = sym
-        primary[sym] = t
-
-    first_tickers = list(primary.values())
-    # Download in batches.
-    hist_map = batch_download(first_tickers, batch_size, workers)
-    intraday_map = latest_intraday_prices(first_tickers, max(25, min(int(batch_size), 75)), workers)
-    results = []
-    for sym in symbols:
-        t = primary[sym]
-        hist = hist_map.get(t)
-        row = calc_technical(sym, t, hist, intraday_map.get(t)) if hist is not None else None
-        if row is not None:
-            results.append(row)
-        elif not sym.isdigit() and not sym.endswith(".BO"):
-            fallback_needed.append(sym)
-
-    # Second pass only for missing NSE symbols: try .BO.
-    if fallback_needed:
-        fallback_tickers = [s + ".BO" for s in fallback_needed]
-        fallback_map = batch_download(fallback_tickers, batch_size, workers)
-        fallback_intraday = latest_intraday_prices(fallback_tickers, max(25, min(int(batch_size), 75)), workers)
-        existing = {r["NSE Symbol"]: r for r in results}
-        for sym in fallback_needed:
-            t = sym + ".BO"
-            row = calc_technical(sym, t, fallback_map.get(t), fallback_intraday.get(t)) if t in fallback_map else None
-            if row is not None:
-                existing[sym] = row
-            elif sym not in existing:
-                existing[sym] = {
-                    "NSE Symbol": sym, "Yahoo Ticker": t,
-                    "Exchange": "NSE/BSE fallback attempted", "Price": np.nan,
-                    "200 EMA": np.nan, "EMA Distance %": np.nan, "Above 200 EMA": False,
-                    "RSI 14": np.nan, "Volume/20D": np.nan, "5D %": np.nan,
-                    "20D %": np.nan, "Technical Status": "No Yahoo price data",
-                }
-        results = list(existing.values())
-
-    by_sym = {r["NSE Symbol"]: r for r in results}
-    final = []
-    for sym in symbols:
-        if sym in by_sym:
-            final.append(by_sym[sym])
-        else:
-            final.append({
-                "NSE Symbol": sym, "Yahoo Ticker": yahoo_candidates(sym)[0],
-                "Exchange": "BSE" if sym.isdigit() else "NSE",
-                "Price": np.nan, "200 EMA": np.nan, "EMA Distance %": np.nan,
-                "Above 200 EMA": False, "RSI 14": np.nan, "Volume/20D": np.nan,
-                "5D %": np.nan, "20D %": np.nan, "Technical Status": "No Yahoo price data",
-            })
-    return pd.DataFrame(final)
-
-
-def score_rows(out):
-    """Calculate a conservative 0-100 technical swing score.
-
-    Five components are scored: EMA trend, RSI, volume, 5D momentum and 20D
-    momentum. A score is only considered valid when at least 4/5 components
-    have real data; missing values are never invented and never produce a
-    misleading perfect score through aggressive re-weighting.
-    """
-    def clip_score(x, lo, hi):
-        if pd.isna(x):
-            return np.nan
-        return max(0.0, min(100.0, (x - lo) / (hi - lo) * 100.0))
-
-    components = pd.DataFrame({
-        "trend": out["EMA Distance %"].apply(lambda x: clip_score(x, 0, 20)),
-        "rsi": out["RSI 14"].apply(
-            lambda x: 100 - abs(x - 55) * 2 if pd.notna(x) else np.nan
-        ).clip(lower=0, upper=100),
-        "volume": out["Volume/20D"].apply(lambda x: clip_score(x, 0.7, 2.0)),
-        "momentum5": out["5D %"].apply(lambda x: clip_score(x, -2, 8)),
-        "momentum20": out["20D %"].apply(lambda x: clip_score(x, -5, 20)),
-    }, index=out.index)
-
-    # 30% trend, 20% RSI, 15% volume, 15% 5D momentum, 20% 20D momentum.
-    weights = pd.Series({
-        "trend": 0.30,
-        "rsi": 0.20,
-        "volume": 0.15,
-        "momentum5": 0.15,
-        "momentum20": 0.20,
-    })
-
-    coverage = components.notna().sum(axis=1)
-    weighted = components.mul(weights, axis=1)
-    available_weight = components.notna().mul(weights, axis=1).sum(axis=1)
-    score = weighted.sum(axis=1, min_count=1).div(
-        available_weight.replace(0, np.nan)
-    )
-
-    # Do not publish a ranking score with fewer than 4 of 5 real components.
-    score = score.where(coverage >= 4, np.nan)
-    return score.round(1)
-
-
-
-
-def _normalize_single_history(hist, ticker):
-    """Normalize a Yahoo single-ticker DataFrame to OHLCV Series."""
+def normalize_ohlcv(hist, ticker):
     if hist is None or hist.empty:
         return None
     h = hist.copy()
@@ -464,225 +322,511 @@ def _normalize_single_history(hist, ticker):
     low = pd.to_numeric(h.get("Low", close), errors="coerce")
     volume = pd.to_numeric(h.get("Volume", pd.Series(index=h.index, dtype=float)), errors="coerce")
     frame = pd.DataFrame({"Close": close, "High": high, "Low": low, "Volume": volume}).dropna(subset=["Close"])
+    if frame.empty:
+        return None
     return frame
 
 
-def _historical_feature_frame(frame):
-    close = frame["Close"]
-    volume = frame["Volume"]
-    high = frame["High"]
-    low = frame["Low"]
+def compute_feature_frame(frame):
+    """All technical indicators, computed with data available ONLY up to each row's own date.
+    Every rolling/ewm/diff/shift operation here is causal by construction, so this frame can be
+    safely used both for 'today' and for constructing historical analog snapshots."""
+    close, high, low, volume = frame["Close"], frame["High"], frame["Low"], frame["Volume"]
+
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
     ema200 = close.ewm(span=200, adjust=False).mean()
+
+    dist20 = (close / ema20 - 1) * 100
+    dist50 = (close / ema50 - 1) * 100
+    dist200 = (close / ema200 - 1) * 100
+
+    slope20 = ema20.pct_change(5) * 100
+    slope50 = ema50.pct_change(10) * 100
+    slope200 = ema200.pct_change(20) * 100
+
     delta = close.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-    rsi = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
-    vol_avg = volume.rolling(20).mean()
-    dist = (close / ema200 - 1) * 100
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    rsi_slope = rsi.diff(5)
+
+    prev_close = close.shift(1)
+    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / 14, adjust=False).mean()
+    atr_pct = (atr / close) * 100
+
+    vol_avg20 = volume.rolling(20).mean()
+    volratio = volume / vol_avg20.replace(0, np.nan)
+    turnover = close * volume
+    turnover_avg20 = turnover.rolling(20).mean()
+
     ret5 = close.pct_change(5) * 100
+    ret10 = close.pct_change(10) * 100
     ret20 = close.pct_change(20) * 100
-    return pd.DataFrame({
-        "dist": dist, "rsi": rsi, "volratio": volume / vol_avg,
-        "ret5": ret5, "ret20": ret20,
+
+    daily_ret = close.pct_change()
+    vola5 = daily_ret.rolling(5).std() * 100
+    vola20 = daily_ret.rolling(20).std() * 100
+
+    high20 = high.rolling(20).max()
+    low20 = low.rolling(20).min()
+    pos20 = ((close - low20) / (high20 - low20).replace(0, np.nan)) * 100
+    dist_high20 = (close / high20 - 1) * 100
+    dist_low20 = (close / low20 - 1) * 100
+
+    high60 = high.rolling(60).max()
+    low60 = low.rolling(60).min()
+    pos60 = ((close - low60) / (high60 - low60).replace(0, np.nan)) * 100
+
+    close_strength = ((close - low) / (high - low).replace(0, np.nan)) * 100
+
+    feats = pd.DataFrame({
+        "close": close, "ema20": ema20, "ema50": ema50, "ema200": ema200,
+        "dist20": dist20, "dist50": dist50, "dist200": dist200,
+        "slope20": slope20, "slope50": slope50, "slope200": slope200,
+        "rsi": rsi, "rsi_slope": rsi_slope,
+        "atr": atr, "atr_pct": atr_pct,
+        "vol_avg20": vol_avg20, "volratio": volratio, "turnover_avg20": turnover_avg20,
+        "ret5": ret5, "ret10": ret10, "ret20": ret20,
+        "vola5": vola5, "vola20": vola20,
+        "pos20": pos20, "pos60": pos60,
+        "dist_high20": dist_high20, "dist_low20": dist_low20,
+        "close_strength": close_strength,
     }, index=frame.index)
+    return feats
 
 
-def _forecast_one(hist, ticker, current_row, analog_k=60):
-    """Historical nearest-setup analog forecast; strictly no look-ahead."""
-    frame = _normalize_single_history(hist, ticker)
-    if frame is None or len(frame) < 280:
-        return {"Forecast Status": "Insufficient forecast history", "Forecast Samples": 0}
-    feats = _historical_feature_frame(frame)
-    # Do not use the last 10 completed sessions as analogs because their forward window is incomplete.
-    usable_end = len(frame) - 11
-    if usable_end <= 30:
-        return {"Forecast Status": "Insufficient forecast history", "Forecast Samples": 0}
+def rsi_trend_label(slope):
+    if pd.isna(slope):
+        return "N/A"
+    if slope > 1:
+        return "Rising"
+    if slope < -1:
+        return "Falling"
+    return "Flat"
 
-    current = pd.Series({
-        "dist": current_row.get("EMA Distance %", np.nan),
-        "rsi": current_row.get("RSI 14", np.nan),
-        "volratio": current_row.get("Volume/20D", np.nan),
-        "ret5": current_row.get("5D %", np.nan),
-        "ret20": current_row.get("20D %", np.nan),
-    }, dtype=float)
-    scales = pd.Series({"dist": 20.0, "rsi": 10.0, "volratio": 0.75, "ret5": 5.0, "ret20": 10.0})
-    valid_current = current.notna()
-    if valid_current.sum() < 4:
-        return {"Forecast Status": "Insufficient current setup data", "Forecast Samples": 0}
 
-    candidates = feats.iloc[:usable_end].copy()
-    candidates = candidates.loc[candidates.notna().sum(axis=1) >= 4]
-    if candidates.empty:
-        return {"Forecast Status": "No historical analogs", "Forecast Samples": 0}
+def ema_slope_label(slope):
+    if pd.isna(slope):
+        return "N/A"
+    if slope > 0.2:
+        return "Up"
+    if slope < -0.2:
+        return "Down"
+    return "Flat"
 
-    d = pd.DataFrame(index=candidates.index)
-    for col in current.index:
-        if pd.notna(current[col]):
-            d[col] = (candidates[col] - current[col]).abs() / scales[col]
-    d["distance"] = d.mean(axis=1, skipna=True)
-    nearest = d.sort_values("distance").head(int(analog_k)).index
 
-    rows = []
-    for idx in nearest:
+# =====================================================================
+# 4. HISTORICAL ANALOG / WALK-FORWARD FORECAST ENGINE (no look-ahead)
+# =====================================================================
+
+def historical_analog_forecast(frame, feats, analog_k, min_turnover_rs):
+    """Compare today's feature snapshot against the stock's own historical setups and
+    measure what ACTUALLY happened next. No future information is used to build the
+    current snapshot, and no future information is used to select or weight analogs —
+    only the standardized distance between past and present feature values."""
+    n_rows = len(frame)
+    if n_rows < MIN_TECH_BARS:
+        return {"Forecast Status": "NO DATA", "Historical Analog Count": 0, "Forecast Confidence": "INSUFFICIENT"}
+
+    # The most recent LOOKAHEAD_DAYS rows cannot be used as analog *sources* because their
+    # forward-looking outcome window is not yet complete.
+    usable_end = n_rows - LOOKAHEAD_DAYS - 1
+    if usable_end < MIN_ANALOG_CANDIDATE_ROWS:
+        return {"Forecast Status": "NO FORECAST", "Historical Analog Count": 0, "Forecast Confidence": "INSUFFICIENT"}
+
+    current = feats.iloc[-1]
+    valid_current = current[FEATURE_COLS].notna()
+    if valid_current.sum() < 6:
+        return {"Forecast Status": "NO FORECAST", "Historical Analog Count": 0, "Forecast Confidence": "INSUFFICIENT"}
+
+    candidates = feats.iloc[:usable_end][FEATURE_COLS]
+    candidates = candidates.loc[candidates.notna().sum(axis=1) >= 6]
+    if len(candidates) < MIN_ANALOG_CANDIDATE_ROWS:
+        return {"Forecast Status": "NO FORECAST", "Historical Analog Count": 0, "Forecast Confidence": "INSUFFICIENT"}
+
+    stds = candidates.std(ddof=0)
+    used_cols = [c for c in FEATURE_COLS if pd.notna(current[c]) and pd.notna(stds.get(c)) and stds.get(c, 0) > 1e-9]
+    if len(used_cols) < 6:
+        return {"Forecast Status": "NO FORECAST", "Historical Analog Count": 0, "Forecast Confidence": "INSUFFICIENT"}
+
+    z = pd.DataFrame(index=candidates.index)
+    for c in used_cols:
+        z[c] = (candidates[c] - current[c]).abs() / stds[c]
+    distance = z.mean(axis=1, skipna=True)
+    distance = distance.dropna()
+    if distance.empty:
+        return {"Forecast Status": "NO FORECAST", "Historical Analog Count": 0, "Forecast Confidence": "INSUFFICIENT"}
+
+    nearest = distance.sort_values().head(int(analog_k))
+    avg_similarity_distance = float(nearest.mean())
+
+    mfe_list, mae_list, end_ret_list = [], [], []
+    for idx in nearest.index:
         pos = frame.index.get_loc(idx)
-        base = float(frame["Close"].iloc[pos])
-        if base <= 0:
+        entry = float(frame["Close"].iloc[pos])
+        if entry <= 0:
             continue
-        rec = {"max5": np.nan, "max10": np.nan, "min5": np.nan, "min10": np.nan}
-        for h in (5, 10):
-            end = min(pos + h + 1, len(frame))
-            if end <= pos + 1:
-                continue
-            highs = frame["High"].iloc[pos+1:end].dropna()
-            lows = frame["Low"].iloc[pos+1:end].dropna()
-            if not highs.empty:
-                rec[f"max{h}"] = float(highs.max() / base - 1) * 100
-            if not lows.empty:
-                rec[f"min{h}"] = float(lows.min() / base - 1) * 100
-        rows.append(rec)
-    if len(rows) < 20:
-        return {"Forecast Status": "Too few analogs", "Forecast Samples": len(rows)}
+        end_pos = min(pos + 1 + LOOKAHEAD_DAYS, n_rows)
+        if end_pos <= pos + 1:
+            continue
+        window_high = frame["High"].iloc[pos + 1:end_pos].dropna()
+        window_low = frame["Low"].iloc[pos + 1:end_pos].dropna()
+        window_close = frame["Close"].iloc[pos + 1:end_pos].dropna()
+        if window_high.empty or window_low.empty or window_close.empty:
+            continue
+        mfe_list.append(float(window_high.max() / entry - 1) * 100)
+        mae_list.append(float(window_low.min() / entry - 1) * 100)
+        end_ret_list.append(float(window_close.iloc[-1] / entry - 1) * 100)
 
-    a = pd.DataFrame(rows)
-    result = {"Forecast Status": "OK", "Forecast Samples": int(len(a))}
-    for h in (5, 10):
-        maxs = a[f"max{h}"].dropna()
-        mins = a[f"min{h}"].dropna()
-        for target in (5, 10, 15, 20, 30, 40):
-            result[f"P +{target}% ({h}D)"] = float((maxs >= target).mean() * 100) if len(maxs) else np.nan
-        result[f"P -5% ({h}D)"] = float((mins <= -5).mean() * 100) if len(mins) else np.nan
-        result[f"Median Max Move ({h}D)"] = float(maxs.median()) if len(maxs) else np.nan
-        result[f"Q25 Max Move ({h}D)"] = float(maxs.quantile(0.25)) if len(maxs) else np.nan
-        result[f"Q75 Max Move ({h}D)"] = float(maxs.quantile(0.75)) if len(maxs) else np.nan
-        result[f"Median Min Move ({h}D)"] = float(mins.median()) if len(mins) else np.nan
-    # A compact historical conviction measure: upside chance minus downside chance,
-    # anchored to +5% in 5D. It is NOT a probability and is deliberately labeled as a score.
-    p_up = result.get("P +5% (5D)", np.nan)
-    p_down = result.get("P -5% (5D)", np.nan)
-    result["Historical Edge Score"] = round(max(0.0, min(100.0, (p_up - p_down + 100) / 2)) if pd.notna(p_up) and pd.notna(p_down) else np.nan, 1)
-    if len(a) >= 50:
-        result["Forecast Confidence"] = "High"
-    elif len(a) >= 30:
-        result["Forecast Confidence"] = "Medium"
+    n = len(mfe_list)
+    if n < MIN_VALID_ANALOGS:
+        return {"Forecast Status": "NO FORECAST", "Historical Analog Count": n, "Forecast Confidence": "INSUFFICIENT"}
+
+    mfe = pd.Series(mfe_list)
+    mae = pd.Series(mae_list)
+    end_ret = pd.Series(end_ret_list)
+
+    p3 = float((mfe >= 3).mean() * 100)
+    p5 = float((mfe >= 5).mean() * 100)
+    p10 = float((mfe >= 10).mean() * 100)
+    pm3 = float((mae <= -3).mean() * 100)
+    pm5 = float((mae <= -5).mean() * 100)
+
+    median_mfe = float(mfe.median())
+    q75_mfe = float(mfe.quantile(0.75))
+    median_mae = float(mae.median())
+    q75_abs_mae = float(mae.abs().quantile(0.75))
+
+    positive_mfe = mfe[mfe > 0]
+    expected_upside = float(positive_mfe.median()) if len(positive_mfe) >= 5 else max(median_mfe, 0.0)
+    expected_downside = float(mae.abs().median())
+    expected_return = float(end_ret.median())
+
+    ratio = expected_upside / expected_downside if expected_downside > 1e-9 else np.nan
+
+    # Confidence: sample count + similarity quality + outcome consistency.
+    iqr_mfe = float(mfe.quantile(0.75) - mfe.quantile(0.25))
+    consistent = iqr_mfe <= (abs(median_mfe) * 3 + 6)
+    good_similarity = avg_similarity_distance <= 1.0
+
+    if n >= 50 and good_similarity and consistent:
+        confidence = "HIGH"
+    elif n >= 25:
+        confidence = "MEDIUM"
+    elif n >= MIN_VALID_ANALOGS:
+        confidence = "LOW"
     else:
-        result["Forecast Confidence"] = "Low"
-    return result
+        confidence = "INSUFFICIENT"
+
+    return {
+        "Forecast Status": "OK",
+        "Forecast Horizon": "5D",
+        "Expected 5D Upside %": round(expected_upside, 2),
+        "Expected 5D Downside %": round(expected_downside, 2),
+        "Expected 5D Return %": round(expected_return, 2),
+        "P(+3%) 5D": round(p3, 1),
+        "P(+5%) 5D": round(p5, 1),
+        "P(+10%) 5D": round(p10, 1),
+        "P(-3%) 5D": round(pm3, 1),
+        "P(-5%) 5D": round(pm5, 1),
+        "Median MFE 5D": round(median_mfe, 2),
+        "75th Percentile MFE 5D": round(q75_mfe, 2),
+        "Median MAE 5D": round(median_mae, 2),
+        "75th Percentile MAE 5D": round(q75_abs_mae, 2),
+        "Upside/Downside Ratio": round(ratio, 2) if pd.notna(ratio) else np.nan,
+        "Historical Analog Count": n,
+        "Forecast Confidence": confidence,
+        "Analog Similarity (avg z-distance)": round(avg_similarity_distance, 3),
+    }
 
 
+def historical_forecast_score(row):
+    """0-100 score built ONLY from the historical forecast statistics above — never a
+    manually re-weighted technical score. A stock cannot score high just because it is
+    far above its 200 EMA, has high RSI, or has a big 5D return; it must show an actual
+    historical forward edge (high P(+5%), low P(-5%), real expected upside, real R:R)."""
+    if row.get("Forecast Status") != "OK":
+        return np.nan
+    p5 = row.get("P(+5%) 5D", np.nan)
+    p10 = row.get("P(+10%) 5D", np.nan)
+    pm5 = row.get("P(-5%) 5D", np.nan)
+    eu = row.get("Expected 5D Upside %", np.nan)
+    rr = row.get("Upside/Downside Ratio", np.nan)
+    n = row.get("Historical Analog Count", 0)
+    if any(pd.isna(x) for x in [p5, p10, pm5, eu]):
+        return np.nan
 
-def add_conviction_columns(out):
-    """Create simple decision-support fields from the historical forecast.
+    s_p5 = min(100.0, max(0.0, p5))
+    s_p10 = min(100.0, max(0.0, p10 * 1.5))
+    s_down = min(100.0, max(0.0, 100.0 - pm5 * 2))
+    s_upside = min(100.0, max(0.0, eu * 8))
+    s_rr = min(100.0, max(0.0, (rr - 0.5) * 40)) if pd.notna(rr) else 0.0
 
-    Expected upside = median of historical maximum move over 5 trading days.
-    Expected downside = absolute median of historical minimum move over 5 days.
-    These are empirical analog statistics, not price targets or guarantees.
-    """
-    out = out.copy()
-    up = pd.to_numeric(out.get("Median Max Move (5D)"), errors="coerce")
-    down_raw = pd.to_numeric(out.get("Median Min Move (5D)"), errors="coerce")
-    down = down_raw.abs()
-    p5 = pd.to_numeric(out.get("P +5% (5D)"), errors="coerce")
-    pdn = pd.to_numeric(out.get("P -5% (5D)"), errors="coerce")
-    samples = pd.to_numeric(out.get("Forecast Samples"), errors="coerce")
+    raw = 0.25 * s_p5 + 0.15 * s_p10 + 0.25 * s_down + 0.20 * s_upside + 0.15 * s_rr
 
-    out["Expected 5D Upside %"] = up.round(2)
-    out["Expected 5D Downside %"] = down.round(2)
-    rr = up.div(down.replace(0, np.nan))
-    out["5D Upside/Downside"] = rr.replace([np.inf, -np.inf], np.nan).round(2)
-
-    def verdict(row):
-        # Do not call a stock a high-conviction setup unless it passes the
-        # user's fundamental + technical intersection and has a valid forecast.
-        if not bool(row.get("Final Pass", False)):
-            return "NOT FINAL PASS"
-        if str(row.get("Forecast Status", "")) != "OK":
-            return "NO FORECAST"
-        u = row.get("Expected 5D Upside %", np.nan)
-        d = row.get("Expected 5D Downside %", np.nan)
-        pu = row.get("P +5% (5D)", np.nan)
-        pdn_ = row.get("P -5% (5D)", np.nan)
-        n = row.get("Forecast Samples", np.nan)
-        ratio = row.get("5D Upside/Downside", np.nan)
-        if any(pd.isna(x) for x in [u, d, pu, pdn_, n, ratio]):
-            return "NO FORECAST"
-        if n >= 50 and pu >= 65 and pdn_ <= 25 and ratio >= 1.50:
-            return "VERY STRONG"
-        if n >= 40 and pu >= 55 and pdn_ <= 35 and ratio >= 1.20:
-            return "STRONG"
-        if n >= 30 and pu >= 45 and pdn_ <= 45 and ratio >= 1.00:
-            return "MODERATE"
-        if pu < pdn_ or ratio < 0.80:
-            return "WEAK / AVOID"
-        return "WATCH"
-
-    out["Swing Conviction"] = out.apply(verdict, axis=1)
-    return out
+    conf_mult = {"HIGH": 1.0, "MEDIUM": 0.80, "LOW": 0.55}.get(row.get("Forecast Confidence"), 0.35)
+    sample_mult = min(1.0, n / 50.0) if n else 0.0
+    score = raw * conf_mult * (0.6 + 0.4 * sample_mult)
+    return round(min(100.0, max(0.0, score)), 1)
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def forecast_download(tickers, years=3, batch_size=50, workers=2):
-    """Download multi-year daily history for a limited forecast candidate set."""
-    tickers = list(dict.fromkeys(tickers))
-    out = {}
-    chunks = [tickers[i:i+batch_size] for i in range(0, len(tickers), batch_size)]
-    def one(chunk):
-        try:
-            data = yf.download(
-                tickers=chunk, period=f"{int(years)}y", interval="1d", auto_adjust=False,
-                progress=False, threads=False, group_by="column"
-            )
-            return chunk, data
-        except Exception:
-            return chunk, None
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [ex.submit(one, c) for c in chunks]
-        for fut in as_completed(futures):
-            chunk, data = fut.result()
-            if data is None or data.empty:
-                continue
-            if isinstance(data.columns, pd.MultiIndex):
-                for ticker in chunk:
-                    try:
-                        sub = data.xs(ticker, axis=1, level=1, drop_level=True)
-                    except Exception:
-                        try:
-                            sub = data[ticker]
-                        except Exception:
-                            continue
-                    out[ticker] = sub
-            elif len(chunk) == 1:
-                out[chunk[0]] = data
-    return out
+def classify_conviction(row, min_turnover_rs):
+    if row.get("Technical Status") != "OK":
+        return "⚫ NO DATA"
+    if row.get("Forecast Status") != "OK":
+        return "⚪ NO FORECAST"
+
+    p5 = row.get("P(+5%) 5D", np.nan)
+    pm5 = row.get("P(-5%) 5D", np.nan)
+    eu = row.get("Expected 5D Upside %", np.nan)
+    ed = row.get("Expected 5D Downside %", np.nan)
+    rr = row.get("Upside/Downside Ratio", np.nan)
+    n = row.get("Historical Analog Count", 0)
+    conf = row.get("Forecast Confidence")
+    above200 = bool(row.get("Above 200 EMA", False))
+    above20 = bool(row.get("Above 20 EMA", False))
+    turnover = row.get("20D Avg Turnover", np.nan)
+    liquidity_ok = pd.notna(turnover) and turnover >= min_turnover_rs
+
+    if any(pd.isna(x) for x in [p5, pm5, eu, ed]):
+        return "⚪ NO FORECAST"
+
+    # Conservative hard AVOID rules override everything else.
+    if pm5 >= 60 or (pd.notna(rr) and ed >= eu) or (not above200 and conf == "LOW"):
+        return "🔴 AVOID"
+
+    if (conf == "HIGH" and p5 >= 65 and pm5 <= 25 and eu >= 6 and pd.notna(rr) and rr >= 1.8
+            and above200 and above20 and liquidity_ok):
+        return "🟢 VERY STRONG"
+
+    if (conf in ("HIGH", "MEDIUM") and p5 >= 55 and pm5 <= 30 and eu >= 4
+            and pd.notna(rr) and rr >= 1.4 and above200):
+        return "🟢 STRONG"
+
+    if p5 >= 45 and pm5 <= 40 and eu > 0 and n >= 25:
+        return "🟡 MODERATE"
+
+    if p5 >= 35 and eu > 0:
+        return "🟡 WATCH"
+
+    return "🔴 WEAK"
 
 
-def run_historical_forecast(out, max_stocks, years, analog_k, batch_size, workers):
-    """Forecast priority: Final Pass -> Fundamental Pass -> Technical Pass -> Swing Score."""
-    work = out.copy()
-    work["_priority"] = (
-        work["Final Pass"].astype(int) * 1000000
-        + work["Fundamental Pass"].astype(int) * 10000
-        + work["Technical Pass"].astype(int) * 100
-        + work["Swing Score"].fillna(-1)
-    )
-    selected = work.sort_values("_priority", ascending=False).head(int(max_stocks))
-    tickers = selected["Yahoo Ticker"].dropna().astype(str).tolist()
-    hist_map = forecast_download(tickers, years=int(years), batch_size=min(50, int(batch_size)), workers=int(workers))
-    records = {}
-    for _, row in selected.iterrows():
-        ticker = str(row.get("Yahoo Ticker", ""))
-        if ticker in hist_map:
-            records[row["NSE Symbol"]] = _forecast_one(hist_map[ticker], ticker, row, analog_k=int(analog_k))
+def swing_call_sentence(row):
+    conv = row.get("Swing Conviction", "⚪ NO FORECAST")
+    if conv == "⚫ NO DATA":
+        return "⚫ NO DATA — insufficient Yahoo price history"
+    if conv == "⚪ NO FORECAST":
+        return "⚪ NO FORECAST — insufficient historical analogs"
+
+    eu = row.get("Expected 5D Upside %", np.nan)
+    ed = row.get("Expected 5D Downside %", np.nan)
+    p5 = row.get("P(+5%) 5D", np.nan)
+    pm5 = row.get("P(-5%) 5D", np.nan)
+    if any(pd.isna(x) for x in [eu, ed, p5, pm5]):
+        return "⚪ NO FORECAST — insufficient historical analogs"
+
+    if conv in ("🟢 VERY STRONG", "🟢 STRONG"):
+        head = "🟢 BUY BIAS"
+    elif conv in ("🟡 MODERATE", "🟡 WATCH"):
+        head = "🟡 WATCH"
+    else:
+        head = "🔴 AVOID"
+    return f"{head} — Expected +{eu:.1f}% in 5D | Downside -{ed:.1f}% | P(+5%) {p5:.0f}% | P(-5%) {pm5:.0f}%"
+
+
+def investment_priority(row):
+    conv = row.get("Swing Conviction", "⚪ NO FORECAST")
+    fp = bool(row.get("Fundamental Pass", False))
+    if conv == "🟢 VERY STRONG":
+        return (0, "1. VERY STRONG + Fund PASS") if fp else (2, "3. VERY STRONG + Fund FAIL")
+    if conv == "🟢 STRONG":
+        return (1, "2. STRONG + Fund PASS") if fp else (3, "4. STRONG + Fund FAIL")
+    if conv == "🟡 MODERATE":
+        return (4, "5. MODERATE + Fund PASS") if fp else (4, "5. MODERATE")
+    if conv == "🟡 WATCH":
+        return (5, "6. WATCH")
+    if conv == "🔴 WEAK":
+        return (6, "7. WEAK")
+    if conv == "🔴 AVOID":
+        return (7, "8. AVOID")
+    if conv == "⚪ NO FORECAST":
+        return (8, "9. NO FORECAST")
+    return (9, "10. NO DATA")
+
+
+# =====================================================================
+# 5. PER-STOCK PIPELINE: one download feeds technicals + forecast
+# =====================================================================
+
+def build_row(sym, ticker, hist, intraday, analog_k, min_turnover_rs):
+    frame = normalize_ohlcv(hist, ticker)
+    base = {
+        "NSE Symbol": sym, "Yahoo Ticker": ticker,
+        "Exchange": "BSE" if ticker.endswith(".BO") else "NSE",
+    }
+    if frame is None or frame.empty:
+        base.update({
+            "Price": np.nan, "Historical Close": np.nan, "Price Source": "N/A", "Price Data Date": None,
+            "Technical Status": "No Yahoo price data",
+        })
+        return base
+
+    feats = compute_feature_frame(frame)
+    historical_close = float(frame["Close"].iloc[-1])
+    hist_date = frame.index[-1]
+
+    intraday_price, intraday_ts = (np.nan, None)
+    if intraday is not None:
+        intraday_price, intraday_ts = intraday
+    if pd.notna(intraday_price) and intraday_price > 0:
+        last_price = float(intraday_price)
+        price_source = "Intraday"
+        price_date = intraday_ts
+    else:
+        last_price = historical_close
+        price_source = "Delayed / Daily Close"
+        price_date = hist_date
+
+    base.update({
+        "Price": last_price, "Historical Close": historical_close,
+        "Price Source": price_source, "Price Data Date": price_date,
+    })
+
+    if len(frame) < MIN_TECH_BARS:
+        base["Technical Status"] = "Insufficient history"
+        return base
+
+    cur = feats.iloc[-1]
+    ema20, ema50, ema200 = float(cur["ema20"]), float(cur["ema50"]), float(cur["ema200"])
+    base.update({
+        "20 EMA": ema20, "50 EMA": ema50, "200 EMA": ema200,
+        "Dist 20 EMA %": (last_price / ema20 - 1) * 100 if ema20 else np.nan,
+        "Dist 50 EMA %": (last_price / ema50 - 1) * 100 if ema50 else np.nan,
+        "Dist 200 EMA %": (last_price / ema200 - 1) * 100 if ema200 else np.nan,
+        "EMA Distance %": (last_price / ema200 - 1) * 100 if ema200 else np.nan,  # legacy alias
+        "Above 20 EMA": bool(last_price > ema20) if ema20 else False,
+        "Above 50 EMA": bool(last_price > ema50) if ema50 else False,
+        "Above 200 EMA": bool(last_price > ema200) if ema200 else False,
+        "20 EMA Slope": float(cur["slope20"]) if pd.notna(cur["slope20"]) else np.nan,
+        "50 EMA Slope": float(cur["slope50"]) if pd.notna(cur["slope50"]) else np.nan,
+        "200 EMA Slope": float(cur["slope200"]) if pd.notna(cur["slope200"]) else np.nan,
+        "20 EMA Trend": ema_slope_label(cur["slope20"]),
+        "50 EMA Trend": ema_slope_label(cur["slope50"]),
+        "200 EMA Trend": ema_slope_label(cur["slope200"]),
+        "RSI 14": float(cur["rsi"]) if pd.notna(cur["rsi"]) else np.nan,
+        "RSI Trend": rsi_trend_label(cur["rsi_slope"]),
+        "ATR 14": float(cur["atr"]) if pd.notna(cur["atr"]) else np.nan,
+        "ATR %": float(cur["atr_pct"]) if pd.notna(cur["atr_pct"]) else np.nan,
+        "20D Avg Volume": float(cur["vol_avg20"]) if pd.notna(cur["vol_avg20"]) else np.nan,
+        "Volume/20D": float(cur["volratio"]) if pd.notna(cur["volratio"]) else np.nan,
+        "20D Avg Turnover": float(cur["turnover_avg20"]) if pd.notna(cur["turnover_avg20"]) else np.nan,
+        "5D %": float(cur["ret5"]) if pd.notna(cur["ret5"]) else np.nan,
+        "20D %": float(cur["ret20"]) if pd.notna(cur["ret20"]) else np.nan,
+        "5D Volatility %": float(cur["vola5"]) if pd.notna(cur["vola5"]) else np.nan,
+        "20D Volatility %": float(cur["vola20"]) if pd.notna(cur["vola20"]) else np.nan,
+        "Position in 20D Range %": float(cur["pos20"]) if pd.notna(cur["pos20"]) else np.nan,
+        "Position in 60D Range %": float(cur["pos60"]) if pd.notna(cur["pos60"]) else np.nan,
+        "Dist from 20D High %": float(cur["dist_high20"]) if pd.notna(cur["dist_high20"]) else np.nan,
+        "Dist from 20D Low %": float(cur["dist_low20"]) if pd.notna(cur["dist_low20"]) else np.nan,
+        "Close Strength %": float(cur["close_strength"]) if pd.notna(cur["close_strength"]) else np.nan,
+        "Technical Status": "OK",
+    })
+
+    forecast = historical_analog_forecast(frame, feats, analog_k, min_turnover_rs)
+    base.update(forecast)
+
+    atr14 = base.get("ATR 14", np.nan)
+    if pd.notna(atr14) and last_price > 0:
+        stop = last_price - 1.5 * atr14
+        base["ATR Stop Distance %"] = round((1.5 * atr14 / last_price) * 100, 2)
+        base["Suggested Stop Loss"] = round(stop, 2)
+    eu = base.get("Expected 5D Upside %", np.nan)
+    atr_pct = base.get("ATR %", np.nan)
+    if pd.notna(eu) and pd.notna(atr_pct) and atr_pct > 1e-9:
+        base["Expected Reward / ATR Risk"] = round(eu / atr_pct, 2)
+
+    return base
+
+
+def run_full_scan(symbols, years, batch_size, workers, analog_k, forecast_limit, min_turnover_rs, progress_cb=None):
+    symbols = [str(x).strip().upper() for x in symbols]
+    ticker_map = {sym: yahoo_candidates(sym)[0] for sym in symbols}
+    first_tickers = list(ticker_map.values())
+
+    hist_map = download_history_batch(first_tickers, years, batch_size, workers)
+    intraday_map = latest_intraday_prices(first_tickers, max(25, min(int(batch_size), 75)), workers)
+
+    rows = {}
+    fallback_needed = []
+    for sym in symbols:
+        t = ticker_map[sym]
+        if t in hist_map:
+            rows[sym] = (t, hist_map[t], intraday_map.get(t))
+        elif not sym.isdigit() and not t.endswith(".BO"):
+            fallback_needed.append(sym)
+
+    if fallback_needed:
+        fallback_tickers = [s + ".BO" for s in fallback_needed]
+        fb_hist = download_history_batch(fallback_tickers, years, batch_size, workers)
+        fb_intraday = latest_intraday_prices(fallback_tickers, max(25, min(int(batch_size), 75)), workers)
+        for sym in fallback_needed:
+            t = sym + ".BO"
+            if t in fb_hist:
+                rows[sym] = (t, fb_hist[t], fb_intraday.get(t))
+
+    # Decide which symbols actually get the (relatively expensive) analog forecast.
+    forecast_set = set(rows.keys())
+    if forecast_limit and forecast_limit > 0 and forecast_limit < len(rows):
+        # Priority: most recent bars available first is arbitrary/fair since fundamentals
+        # haven't been merged yet at this stage — simply forecast the first N discovered so
+        # the limit is deterministic; nothing is silently dropped from the output table.
+        forecast_set = set(list(rows.keys())[: int(forecast_limit)])
+
+    records = []
+    total = len(symbols)
+    done = 0
+    for sym in symbols:
+        done += 1
+        if progress_cb and done % 50 == 0:
+            progress_cb(done, total)
+        if sym in rows:
+            t, hist, intraday = rows[sym]
+            if sym in forecast_set:
+                rec = build_row(sym, t, hist, intraday, analog_k, min_turnover_rs)
+            else:
+                rec = build_row(sym, t, hist, intraday, 0, min_turnover_rs)
+                if rec.get("Technical Status") == "OK":
+                    rec["Forecast Status"] = "NO FORECAST"
+                    rec["Historical Analog Count"] = 0
+                    rec["Forecast Confidence"] = "NOT SELECTED"
         else:
-            records[row["NSE Symbol"]] = {"Forecast Status": "No forecast history", "Forecast Samples": 0}
-    cols = sorted({k for v in records.values() for k in v.keys()})
-    fdf = pd.DataFrame.from_dict(records, orient="index") if records else pd.DataFrame()
-    if not fdf.empty:
-        fdf.index.name = "NSE Symbol"
-        fdf = fdf.reset_index()
-    return fdf
+            t = ticker_map[sym]
+            rec = {
+                "NSE Symbol": sym, "Yahoo Ticker": t,
+                "Exchange": "BSE" if t.endswith(".BO") else "NSE",
+                "Price": np.nan, "Historical Close": np.nan, "Price Source": "N/A", "Price Data Date": None,
+                "Technical Status": "No Yahoo price data",
+            }
+        records.append(rec)
 
-# --------------------------- LOAD SOURCES ---------------------------
-st.subheader("1. Build broad universe")
+    df = pd.DataFrame(records)
+    for col in ["Forecast Status", "Historical Analog Count", "Forecast Confidence"]:
+        if col not in df.columns:
+            df[col] = np.nan
+    df["Forecast Status"] = df["Forecast Status"].fillna("NO DATA")
+    df["Historical Analog Count"] = df["Historical Analog Count"].fillna(0)
+    df["Forecast Confidence"] = df["Forecast Confidence"].fillna("INSUFFICIENT")
+    return df
+
+
+# =====================================================================
+# 6. LOAD SOURCES
+# =====================================================================
+st.subheader("1. Build complete NSE universe")
 try:
     u_title, u_query, universe, u_source_url = load_universe(universe_url, int(universe_size))
     st.success(f"Broad universe loaded: {len(universe)} stocks.")
@@ -698,21 +842,59 @@ except Exception as e:
     st.error(f"Fundamental source could not be loaded: {e}")
     st.stop()
 
-# Ensure every fundamental candidate is technically checked even if it falls outside the first N broad stocks.
+# Every fundamental candidate is checked even if it falls outside the broad universe list.
 combined = pd.concat([universe, fundamentals], ignore_index=True)
 combined["NSE Symbol"] = combined["NSE Symbol"].astype(str).str.upper().str.strip()
 combined = combined[combined["NSE Symbol"].ne("") & combined["NSE Symbol"].ne("NAN")].drop_duplicates("NSE Symbol")
 fund_syms = set(fundamentals["NSE Symbol"].astype(str).str.upper().str.strip())
 combined["Fundamental Pass"] = combined["NSE Symbol"].isin(fund_syms)
 
-st.write(f"**Technical universe sent to Yahoo: {len(combined)} stocks** (minimum broad universe {int(universe_size)} + any fundamental-qualified additions).")
-st.caption("This is the key V6 change: technical analysis is no longer limited to the 50 Screener-qualified names.")
+universe_discovered = len(combined)
+st.write(f"**Complete technical/forecast universe: {universe_discovered} stocks** (minimum broad universe {int(universe_size)} + any fundamental-qualified additions).")
+st.caption("Every stock discovered here stays in the final table — missing data is marked NO DATA, it is never dropped or treated as a pass.")
 
-if st.button("🚀 RUN V7.1 — SCAN 1000+ STOCKS", type="primary", use_container_width=True):
-    with st.spinner(f"Scanning {len(combined)} stocks for price, 200 EMA, RSI, volume and momentum..."):
-        tech = technical_scan(combined["NSE Symbol"].tolist(), int(batch_size), int(max_workers))
+if st.button("🚀 RUN V8 — FULL NSE HISTORICAL FORECAST SCAN", type="primary", use_container_width=True):
+    prog = st.progress(0.0, text="Downloading price history...")
 
-    out = combined.merge(tech, on="NSE Symbol", how="left")
+    def _cb(done, total):
+        prog.progress(min(1.0, done / max(1, total)), text=f"Processing {done}/{total} stocks...")
+
+    with st.spinner(f"Downloading {int(forecast_years)}y history and building technical + historical-analog forecasts for {universe_discovered} stocks..."):
+        out = run_full_scan(
+            combined["NSE Symbol"].tolist(), int(forecast_years), int(batch_size), int(max_workers),
+            int(analog_count), int(forecast_limit), float(min_turnover),
+            progress_cb=_cb,
+        )
+    prog.empty()
+
+    out = combined.merge(out, on="NSE Symbol", how="left", suffixes=("", "_r"))
+    out["Technical Status"] = out["Technical Status"].fillna("No Yahoo price data")
+
+    # Requirement: ensure every dataframe column exists before sorting/display, even in the
+    # edge case where not a single stock produced a given field this run.
+    _ensure_cols = [
+        "Price", "Historical Close", "Price Source", "Price Data Date",
+        "20 EMA", "50 EMA", "200 EMA", "Dist 20 EMA %", "Dist 50 EMA %", "Dist 200 EMA %", "EMA Distance %",
+        "Above 20 EMA", "Above 50 EMA", "Above 200 EMA",
+        "20 EMA Slope", "50 EMA Slope", "200 EMA Slope", "20 EMA Trend", "50 EMA Trend", "200 EMA Trend",
+        "RSI 14", "RSI Trend", "ATR 14", "ATR %", "20D Avg Volume", "Volume/20D", "20D Avg Turnover",
+        "5D %", "20D %", "5D Volatility %", "20D Volatility %",
+        "Position in 20D Range %", "Position in 60D Range %", "Dist from 20D High %", "Dist from 20D Low %",
+        "Close Strength %", "Forecast Horizon",
+        "Expected 5D Upside %", "Expected 5D Downside %", "Expected 5D Return %",
+        "P(+3%) 5D", "P(+5%) 5D", "P(+10%) 5D", "P(-3%) 5D", "P(-5%) 5D",
+        "Median MFE 5D", "75th Percentile MFE 5D", "Median MAE 5D", "75th Percentile MAE 5D",
+        "Upside/Downside Ratio", "Historical Analog Count", "Forecast Confidence", "Forecast Status",
+        "Analog Similarity (avg z-distance)", "ATR Stop Distance %", "Suggested Stop Loss",
+        "Expected Reward / ATR Risk", "Technical Status",
+    ]
+    for _c in _ensure_cols:
+        if _c not in out.columns:
+            out[_c] = np.nan
+    out["Forecast Status"] = out["Forecast Status"].fillna("NO DATA")
+    out["Historical Analog Count"] = out["Historical Analog Count"].fillna(0)
+    out["Forecast Confidence"] = out["Forecast Confidence"].fillna("INSUFFICIENT")
+
     out["Technical Pass"] = out["Technical Status"].eq("OK")
     if require_above_200:
         out["Technical Pass"] &= out["Above 200 EMA"].fillna(False)
@@ -723,79 +905,126 @@ if st.button("🚀 RUN V7.1 — SCAN 1000+ STOCKS", type="primary", use_containe
     if min_volume_ratio > 0:
         out["Technical Pass"] &= out["Volume/20D"].ge(min_volume_ratio).fillna(False)
 
-    out["Swing Score"] = score_rows(out)
-    out["Score Coverage"] = out[["EMA Distance %", "RSI 14", "Volume/20D", "5D %", "20D %"]].notna().sum(axis=1)
     out["Final Pass"] = out["Fundamental Pass"] & out["Technical Pass"]
 
-    if enable_forecast:
-        with st.spinner(f"Building historical 5D/10D probability forecasts for up to {int(forecast_max_stocks)} priority stocks..."):
-            forecast_df = run_historical_forecast(
-                out, int(forecast_max_stocks), int(forecast_years), int(analog_count), int(batch_size), int(max_workers)
-            )
-        if not forecast_df.empty:
-            out = out.merge(forecast_df, on="NSE Symbol", how="left")
-        else:
-            out["Forecast Status"] = "Unavailable"
-            out["Forecast Samples"] = 0
-    else:
-        out["Forecast Status"] = "Disabled"
-        out["Forecast Samples"] = 0
+    out["Historical Forecast Score"] = out.apply(historical_forecast_score, axis=1)
+    out["Swing Conviction"] = out.apply(lambda r: classify_conviction(r, float(min_turnover)), axis=1)
+    out["Swing Call"] = out.apply(swing_call_sentence, axis=1)
+    pr = out.apply(investment_priority, axis=1)
+    out["Investment Priority Rank"] = pr.apply(lambda x: x[0])
+    out["Investment Priority"] = pr.apply(lambda x: x[1])
 
-    out = add_conviction_columns(out)
-
-    # Final ranking is only for stocks satisfying the exact fundamental filters.
     out = out.sort_values(
-        ["Final Pass", "Fundamental Pass", "Technical Pass", "Swing Score", "5D %"],
-        ascending=[False, False, False, False, False],
+        ["Investment Priority Rank", "Historical Forecast Score", "P(+5%) 5D", "Upside/Downside Ratio", "Expected 5D Upside %"],
+        ascending=[True, False, False, False, False],
         na_position="last",
     )
 
-    ok_tech = int(out["Technical Status"].eq("OK").sum())
+    # ---------------- Diagnostics ----------------
+    tech_ok = int(out["Technical Status"].eq("OK").sum())
+    tech_missing = universe_discovered - tech_ok
+    forecast_calc = int(out["Forecast Status"].eq("OK").sum())
+    forecast_unavailable = universe_discovered - forecast_calc
     fund_count = int(out["Fundamental Pass"].sum())
     final_count = int(out["Final Pass"].sum())
-    missing = int((~out["Technical Status"].eq("OK")).sum())
+    conv_counts = out["Swing Conviction"].value_counts()
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Stocks scanned", len(out))
-    c2.metric("Technical data OK", ok_tech)
-    c3.metric("Fundamental pass", fund_count)
-    c4.metric("Final pass", final_count)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("NSE stocks scanned", universe_discovered)
+    c2.metric("Forecasts available", forecast_calc)
+    c3.metric("🟢 VERY STRONG", int(conv_counts.get("🟢 VERY STRONG", 0)))
+    c4.metric("🟢 STRONG", int(conv_counts.get("🟢 STRONG", 0)))
+    c5.metric("Fundamental pass", fund_count)
 
-    st.subheader("V7.1 Final Ranked Results")
-    st.success(f"{final_count} stocks passed all 7 fundamental filters + selected technical filters.")
-    if missing:
-        st.warning(f"{missing} stocks had insufficient/missing Yahoo price history. They are NOT treated as passes.")
+    st.subheader("TOP SWING CANDIDATES")
+    top_cols = [c for c in [
+        "Company", "NSE Symbol", "Fundamental Pass", "Price",
+        "Expected 5D Upside %", "Expected 5D Downside %", "P(+5%) 5D", "P(-5%) 5D",
+        "Upside/Downside Ratio", "Historical Forecast Score", "Forecast Confidence",
+        "Swing Conviction", "Swing Call", "Suggested Stop Loss",
+    ] if c in out.columns]
+    top_table = out[out["Swing Conviction"].isin(["🟢 VERY STRONG", "🟢 STRONG", "🟡 MODERATE"])].copy()
+    if top_table.empty:
+        st.info("No stocks currently meet the VERY STRONG / STRONG / MODERATE conviction bar. Showing the best-ranked candidates instead.")
+        top_table = out.head(50)
+    st.dataframe(top_table[top_cols].head(200), use_container_width=True, hide_index=True)
 
+    st.divider()
+    st.subheader("FULL NSE SCAN")
     display_cols = [c for c in [
-        "Company", "NSE Symbol", "Exchange", "Yahoo Ticker", "Fundamental Pass",
-        "Price", "Historical Close", "200 EMA", "EMA Distance %", "Above 200 EMA", "RSI 14",
-        "Volume/20D", "5D %", "20D %", "Swing Score", "Score Coverage",
-        "Expected 5D Upside %", "Expected 5D Downside %", "5D Upside/Downside", "Swing Conviction",
-        "Forecast Status", "Forecast Samples", "Forecast Confidence", "Historical Edge Score",
-        "P +5% (5D)", "P +10% (5D)", "P +20% (5D)", "P +40% (5D)", "P -5% (5D)",
-        "Median Max Move (5D)", "P +5% (10D)", "P +10% (10D)", "P +20% (10D)", "P +40% (10D)", "P -5% (10D)",
-        "Median Max Move (10D)", "Technical Status", "Technical Pass", "Final Pass"
+        "Company", "NSE Symbol", "Exchange", "Yahoo Ticker", "Fundamental Pass", "Technical Pass", "Final Pass",
+        "Price", "Historical Close", "Price Source", "Price Data Date",
+        "200 EMA", "50 EMA", "20 EMA", "Dist 20 EMA %", "Dist 50 EMA %", "Dist 200 EMA %",
+        "20 EMA Trend", "50 EMA Trend", "200 EMA Trend",
+        "Above 20 EMA", "Above 50 EMA", "Above 200 EMA",
+        "RSI 14", "RSI Trend", "ATR 14", "ATR %",
+        "20D Avg Volume", "Volume/20D", "20D Avg Turnover",
+        "5D %", "20D %", "5D Volatility %", "20D Volatility %",
+        "Position in 20D Range %", "Position in 60D Range %",
+        "Dist from 20D High %", "Dist from 20D Low %", "Close Strength %",
+        "Forecast Horizon", "Expected 5D Upside %", "Expected 5D Downside %", "Expected 5D Return %",
+        "P(+3%) 5D", "P(+5%) 5D", "P(+10%) 5D", "P(-3%) 5D", "P(-5%) 5D",
+        "Median MFE 5D", "75th Percentile MFE 5D", "Median MAE 5D", "75th Percentile MAE 5D",
+        "Upside/Downside Ratio", "Historical Analog Count", "Forecast Confidence", "Forecast Status",
+        "Historical Forecast Score", "Swing Conviction", "Swing Call",
+        "ATR Stop Distance %", "Suggested Stop Loss", "Expected Reward / ATR Risk",
+        "Investment Priority", "Technical Status",
     ] if c in out.columns]
 
     st.dataframe(out[display_cols], use_container_width=True, hide_index=True)
     st.download_button(
-        "⬇️ Download V7.1 full scan CSV",
+        "⬇️ Download V8 full scan CSV",
         out.to_csv(index=False).encode(),
-        "smart_stock_scanner_v7_1_full_scan.csv",
+        "smart_stock_scanner_v8_full_scan.csv",
         "text/csv",
         use_container_width=True,
     )
 
     st.divider()
-    st.subheader("How V7 works")
-    st.write(
-        "1) Scan a broad 1000+ listed-stock universe for technical history. "
-        "2) Add all stocks from the exact 7-filter Screener result so none of the fundamental-qualified names are lost. "
-        "3) Calculate 20/50/200 EMA, Wilder RSI(14), ATR(14), volume/20D and 5D/20D momentum locally. "
-        "4) Apply technical filters and keep the exact fundamental ∩ technical intersection. "
-        "5) Rank with the existing 0–100 Swing Score. "
-        "6) For priority candidates, find nearest historical setups from up to 5 years of daily data and estimate the empirical chance of reaching +5/+10/+15/+20/+30/+40% within 5/10 trading days, plus -5% downside probability. No future values are used to build historical features."
+    st.subheader("Data quality / diagnostics")
+    st.code(
+        f"Universe discovered:        {universe_discovered}\n"
+        f"Technical data available:   {tech_ok}\n"
+        f"Technical data missing:     {tech_missing}\n"
+        f"Forecast calculated:        {forecast_calc}\n"
+        f"Forecast unavailable:       {forecast_unavailable}\n"
+        f"Fundamental-qualified:      {fund_count}\n"
+        f"Technical Pass:             {int(out['Technical Pass'].sum())}\n"
+        f"Final strong candidates:    {final_count}\n"
+        f"VERY STRONG:                {int(conv_counts.get('🟢 VERY STRONG', 0))}\n"
+        f"STRONG:                     {int(conv_counts.get('🟢 STRONG', 0))}\n"
+        f"MODERATE:                   {int(conv_counts.get('🟡 MODERATE', 0))}\n"
+        f"WATCH:                      {int(conv_counts.get('🟡 WATCH', 0))}\n"
+        f"WEAK:                       {int(conv_counts.get('🔴 WEAK', 0))}\n"
+        f"AVOID:                      {int(conv_counts.get('🔴 AVOID', 0))}\n"
+        f"NO FORECAST:                {int(conv_counts.get('⚪ NO FORECAST', 0))}\n"
+        f"NO DATA:                    {int(conv_counts.get('⚫ NO DATA', 0))}\n"
     )
+    if tech_missing:
+        st.warning(f"{tech_missing} stocks had insufficient/missing Yahoo price history. They remain in the table marked NO DATA and are NEVER treated as a pass.")
+
+    st.divider()
+    st.subheader("How the V8 forecast engine works")
+    st.write(
+        "1) Build the complete broad NSE universe plus every exact-7-filter fundamental candidate — nothing is capped at 1000. "
+        "2) Download daily OHLCV history once per stock (2–4 workers, batched, retried with backoff) and reuse it for both "
+        "current indicators and the forecast — no per-analog web requests. "
+        "3) Compute 20/50/200 EMA, Wilder RSI(14), Wilder ATR(14), slopes, volatility, range position and more, causally "
+        "(each value only ever uses data up to its own date). "
+        "4) For every stock with enough history, build a standardized feature snapshot for today and find its K nearest "
+        "historical analogs using only data available on or before each historical date. "
+        "5) For each analog, measure what ACTUALLY happened over the next 3–5 trading days (max favorable/adverse excursion, "
+        "end-of-window return) — this is the walk-forward step, and it never uses information from after 'today'. "
+        "6) Aggregate analogs into real historical hit-rates (P(+3/5/10%), P(-3/5%)) and robust expected upside/downside, "
+        "then classify Forecast Confidence from sample size, analog similarity, and outcome consistency. "
+        "7) Historical Forecast Score, Swing Conviction and Swing Call are all derived only from these historical statistics — "
+        "never from raw technicals alone, and never from fewer than 10 valid analogs."
+    )
+
+st.warning(
+    "This is a historical-pattern forecast, not a guaranteed prediction. Probabilities represent historical hit rates "
+    "among comparable past setups. Market conditions can change and past performance does not guarantee future results."
+)
 
 st.caption(
     "Research tool only — not investment advice. Screener does not provide a public developer API; this app reads public screen pages. "
