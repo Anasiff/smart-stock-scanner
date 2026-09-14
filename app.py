@@ -11,7 +11,7 @@ from bs4 import BeautifulSoup
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Smart Stock Scanner V7", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Smart Stock Scanner V7.1", page_icon="📈", layout="wide")
 
 DEFAULT_FUNDAMENTAL_URL = "https://www.screener.in/screens/3635525/1/"
 DEFAULT_UNIVERSE_URL = "https://www.screener.in/screens/509570/all-companies/?order=desc"
@@ -21,8 +21,8 @@ DEFAULT_QUERY = (
     "Promoter holding > 50"
 )
 
-st.title("📈 Smart Stock Scanner V7")
-st.caption("1000+ stock technical scan • exact 7 fundamental filters • 5-factor Swing Score • historical probability forecast • BTST / 2–5 day swing research")
+st.title("📈 Smart Stock Scanner V7.1")
+st.caption("1000+ stock technical scan • exact 7 fundamental filters • 5-factor Swing Score • historical probability forecast • 5D expected upside/downside • Swing Conviction • BTST / 2–5 day swing research")
 
 st.info(
     "V7 keeps the V6 architecture and adds a historical-analog probability layer. It does NOT predict a guaranteed "
@@ -569,6 +569,56 @@ def _forecast_one(hist, ticker, current_row, analog_k=60):
     return result
 
 
+
+def add_conviction_columns(out):
+    """Create simple decision-support fields from the historical forecast.
+
+    Expected upside = median of historical maximum move over 5 trading days.
+    Expected downside = absolute median of historical minimum move over 5 days.
+    These are empirical analog statistics, not price targets or guarantees.
+    """
+    out = out.copy()
+    up = pd.to_numeric(out.get("Median Max Move (5D)"), errors="coerce")
+    down_raw = pd.to_numeric(out.get("Median Min Move (5D)"), errors="coerce")
+    down = down_raw.abs()
+    p5 = pd.to_numeric(out.get("P +5% (5D)"), errors="coerce")
+    pdn = pd.to_numeric(out.get("P -5% (5D)"), errors="coerce")
+    samples = pd.to_numeric(out.get("Forecast Samples"), errors="coerce")
+
+    out["Expected 5D Upside %"] = up.round(2)
+    out["Expected 5D Downside %"] = down.round(2)
+    rr = up.div(down.replace(0, np.nan))
+    out["5D Upside/Downside"] = rr.replace([np.inf, -np.inf], np.nan).round(2)
+
+    def verdict(row):
+        # Do not call a stock a high-conviction setup unless it passes the
+        # user's fundamental + technical intersection and has a valid forecast.
+        if not bool(row.get("Final Pass", False)):
+            return "NOT FINAL PASS"
+        if str(row.get("Forecast Status", "")) != "OK":
+            return "NO FORECAST"
+        u = row.get("Expected 5D Upside %", np.nan)
+        d = row.get("Expected 5D Downside %", np.nan)
+        pu = row.get("P +5% (5D)", np.nan)
+        pdn_ = row.get("P -5% (5D)", np.nan)
+        n = row.get("Forecast Samples", np.nan)
+        ratio = row.get("5D Upside/Downside", np.nan)
+        if any(pd.isna(x) for x in [u, d, pu, pdn_, n, ratio]):
+            return "NO FORECAST"
+        if n >= 50 and pu >= 65 and pdn_ <= 25 and ratio >= 1.50:
+            return "VERY STRONG"
+        if n >= 40 and pu >= 55 and pdn_ <= 35 and ratio >= 1.20:
+            return "STRONG"
+        if n >= 30 and pu >= 45 and pdn_ <= 45 and ratio >= 1.00:
+            return "MODERATE"
+        if pu < pdn_ or ratio < 0.80:
+            return "WEAK / AVOID"
+        return "WATCH"
+
+    out["Swing Conviction"] = out.apply(verdict, axis=1)
+    return out
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def forecast_download(tickers, years=3, batch_size=50, workers=2):
     """Download multi-year daily history for a limited forecast candidate set."""
@@ -658,7 +708,7 @@ combined["Fundamental Pass"] = combined["NSE Symbol"].isin(fund_syms)
 st.write(f"**Technical universe sent to Yahoo: {len(combined)} stocks** (minimum broad universe {int(universe_size)} + any fundamental-qualified additions).")
 st.caption("This is the key V6 change: technical analysis is no longer limited to the 50 Screener-qualified names.")
 
-if st.button("🚀 RUN V6.3 — SCAN 1000+ STOCKS", type="primary", use_container_width=True):
+if st.button("🚀 RUN V7.1 — SCAN 1000+ STOCKS", type="primary", use_container_width=True):
     with st.spinner(f"Scanning {len(combined)} stocks for price, 200 EMA, RSI, volume and momentum..."):
         tech = technical_scan(combined["NSE Symbol"].tolist(), int(batch_size), int(max_workers))
 
@@ -691,6 +741,8 @@ if st.button("🚀 RUN V6.3 — SCAN 1000+ STOCKS", type="primary", use_containe
         out["Forecast Status"] = "Disabled"
         out["Forecast Samples"] = 0
 
+    out = add_conviction_columns(out)
+
     # Final ranking is only for stocks satisfying the exact fundamental filters.
     out = out.sort_values(
         ["Final Pass", "Fundamental Pass", "Technical Pass", "Swing Score", "5D %"],
@@ -709,7 +761,7 @@ if st.button("🚀 RUN V6.3 — SCAN 1000+ STOCKS", type="primary", use_containe
     c3.metric("Fundamental pass", fund_count)
     c4.metric("Final pass", final_count)
 
-    st.subheader("V7 Final Ranked Results")
+    st.subheader("V7.1 Final Ranked Results")
     st.success(f"{final_count} stocks passed all 7 fundamental filters + selected technical filters.")
     if missing:
         st.warning(f"{missing} stocks had insufficient/missing Yahoo price history. They are NOT treated as passes.")
@@ -718,6 +770,7 @@ if st.button("🚀 RUN V6.3 — SCAN 1000+ STOCKS", type="primary", use_containe
         "Company", "NSE Symbol", "Exchange", "Yahoo Ticker", "Fundamental Pass",
         "Price", "Historical Close", "200 EMA", "EMA Distance %", "Above 200 EMA", "RSI 14",
         "Volume/20D", "5D %", "20D %", "Swing Score", "Score Coverage",
+        "Expected 5D Upside %", "Expected 5D Downside %", "5D Upside/Downside", "Swing Conviction",
         "Forecast Status", "Forecast Samples", "Forecast Confidence", "Historical Edge Score",
         "P +5% (5D)", "P +10% (5D)", "P +20% (5D)", "P +40% (5D)", "P -5% (5D)",
         "Median Max Move (5D)", "P +5% (10D)", "P +10% (10D)", "P +20% (10D)", "P +40% (10D)", "P -5% (10D)",
@@ -726,9 +779,9 @@ if st.button("🚀 RUN V6.3 — SCAN 1000+ STOCKS", type="primary", use_containe
 
     st.dataframe(out[display_cols], use_container_width=True, hide_index=True)
     st.download_button(
-        "⬇️ Download V7 full scan CSV",
+        "⬇️ Download V7.1 full scan CSV",
         out.to_csv(index=False).encode(),
-        "smart_stock_scanner_v7_full_scan.csv",
+        "smart_stock_scanner_v7_1_full_scan.csv",
         "text/csv",
         use_container_width=True,
     )
