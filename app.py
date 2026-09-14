@@ -143,6 +143,32 @@ def parse_company_rows(soup):
 
 
 @st.cache_data(ttl=900, show_spinner=False)
+def _get_with_retry(url, headers, timeout=25, max_retries=5, base_delay=2.0):
+    """GET with exponential backoff on 429 / transient errors, honoring Retry-After when present.
+    Screener.in rate-limits fast, tight-loop pagination — this is what was throwing
+    '429 Client Error: Too Many Requests'."""
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout)
+            if r.status_code == 429:
+                retry_after = r.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after and retry_after.isdigit() else base_delay * (2 ** attempt)
+                time.sleep(min(wait, 30))
+                continue
+            if r.status_code >= 500:
+                time.sleep(base_delay * (2 ** attempt))
+                continue
+            r.raise_for_status()
+            return r
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            time.sleep(base_delay * (2 ** attempt))
+    if last_exc:
+        raise last_exc
+    raise requests.exceptions.RequestException(f"Failed to fetch {url} after {max_retries} retries (rate limited).")
+
+
 def fetch_public_screen(url, max_pages=20, stop_after=None):
     if "screener.in/screens/" not in url:
         raise ValueError("Please provide a public Screener.in screen URL.")
@@ -155,8 +181,9 @@ def fetch_public_screen(url, max_pages=20, stop_after=None):
 
     for page in range(1, max_pages + 1):
         page_url = set_page(url, page)
-        r = requests.get(page_url, headers=HEADERS, timeout=25)
-        r.raise_for_status()
+        if page > 1:
+            time.sleep(1.2)  # pace requests so Screener.in doesn't rate-limit the scan
+        r = _get_with_retry(page_url, HEADERS)
         soup = BeautifulSoup(r.text, "html.parser")
         last_url = r.url
         if page == 1:
