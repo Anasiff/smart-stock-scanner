@@ -427,7 +427,7 @@ def score_rows(out):
     available_weight = components.notna().mul(weights, axis=1).sum(axis=1)
     score = weighted.sum(axis=1, min_count=1).div(
         available_weight.replace(0, np.nan)
-    ).mul(100.0)
+    )
 
     # Do not publish a ranking score with fewer than 4 of 5 real components.
     score = score.where(coverage >= 4, np.nan)
